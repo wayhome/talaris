@@ -228,7 +228,7 @@ mod linux_impl {
         // 字节捞出来当 leftover 起始。
         let mut tmp = vec![0_u8; 4096];
         let mut resp = Vec::<u8>::new();
-        let mut leftover_bytes = Vec::<u8>::new();
+        let leftover_bytes: Vec<u8>;
         loop {
             let ud_recv = UserData::new(OpKind::Recv, 99);
             // SAFETY: tmp 活在 fn 内
@@ -263,58 +263,18 @@ mod linux_impl {
                 .submit_recv_multishot(fd, BGID, ud_ms)
                 .expect("arm multishot");
         }
-        let submitted = proactor.submit().expect("submit");
-        eprintln!("[raw] multishot armed; submit() returned n={submitted}");
-        // 早期探：先小窗口 wait + drain 一次，看 multishot 是否真的活
-        proactor.wait_for_cqe(1).expect("wait first cqe");
-        let mut probe_chunks: Vec<(u16, usize, bool)> = Vec::new();
-        proactor.drain_completions(|c| {
-            probe_chunks.push((
-                c.buffer_id().unwrap_or(u16::MAX),
-                c.to_result().unwrap_or(0),
-                c.has_more(),
-            ));
-        });
-        eprintln!(
-            "[raw] first CQE drain: {} entries, first = {:?}",
-            probe_chunks.len(),
-            probe_chunks.first()
-        );
-        // 把 probe 拿到的 chunk 喂回 leftover 然后 recycle
-        let mut leftover_extra: Vec<u8> = Vec::new();
-        for &(bid, n, _more) in &probe_chunks {
-            if bid != u16::MAX && n > 0 {
-                let slice = &buf_ring.buffer(bid)[..n];
-                leftover_extra.extend_from_slice(slice);
-                buf_ring.recycle(bid);
-            }
-        }
+        proactor.submit().expect("submit");
 
         // ── Recv loop ────────────────────────────────────────────────────
         let mut arrivals: Vec<Instant> = Vec::with_capacity(stop.cap_hint());
         let mut frame_count = 0_u64;
         let mut leftover = leftover_bytes;
-        leftover.extend_from_slice(&leftover_extra);
         leftover.reserve(64 * 1024);
-        // 如果 probe 阶段 has_more=false 了就 rearm
-        let mut multishot_armed = probe_chunks
-            .last()
-            .map_or(true, |&(_, _, more)| more);
+        let mut multishot_armed = true;
 
         let bench_start = Instant::now();
-        let mut loop_iter: u64 = 0;
-        let mut last_log = Instant::now();
 
         'outer: loop {
-            loop_iter += 1;
-            if last_log.elapsed() >= Duration::from_secs(1) {
-                eprintln!(
-                    "[raw] iter={loop_iter} frames={frame_count} leftover={}B armed={multishot_armed}",
-                    leftover.len()
-                );
-                last_log = Instant::now();
-            }
-
             // Parse all complete frames in leftover
             let mut pos = 0_usize;
             while pos < leftover.len() {
@@ -361,15 +321,15 @@ mod linux_impl {
 
             proactor.wait_for_cqe(1).expect("wait cqe");
 
-            // 把所有 ready CQE 一口气吃干净，能批多深就批多深
+            // 把所有 ready CQE 一口气吃干净
             let mut rearm_needed = false;
             let mut chunks: Vec<(u16, usize)> = Vec::with_capacity(32);
-            let mut weird_cqes: u32 = 0;
             proactor.drain_completions(|c| {
                 let res = match c.to_result() {
                     Ok(n) => n,
-                    Err(e) => {
-                        eprintln!("[raw] CQE Err: {e}, more={}", c.has_more());
+                    // -ENOBUFS：multishot 在 buffer ring 空时退出，has_more=false，
+                    // 主循环检测到后 re-arm。loopback 高速场景下偶尔会跑出来。
+                    Err(_) => {
                         if !c.has_more() {
                             rearm_needed = true;
                         }
@@ -377,7 +337,6 @@ mod linux_impl {
                     }
                 };
                 if res == 0 {
-                    weird_cqes += 1;
                     if !c.has_more() {
                         rearm_needed = true;
                     }
@@ -385,16 +344,11 @@ mod linux_impl {
                 }
                 if let Some(bid) = c.buffer_id() {
                     chunks.push((bid, res));
-                } else {
-                    eprintln!("[raw] CQE w/o buffer_id, res={res}, flags={:x}", c.flags);
                 }
                 if !c.has_more() {
                     rearm_needed = true;
                 }
             });
-            if weird_cqes > 0 {
-                eprintln!("[raw] {weird_cqes} CQE res=0 drained");
-            }
 
             // 复制每个 chunk 到 leftover，然后 recycle 对应 bid
             for &(bid, n) in &chunks {

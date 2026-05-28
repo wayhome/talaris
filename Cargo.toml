@@ -82,23 +82,15 @@ debug         = true
 # `target/release/deps/<name>-<hash>`（带 hash，因为 dev-dep 不一样）。
 
 [[bench]]
-name    = "proactor_overhead"
-harness = false
-
-[[bench]]
-name    = "tcp_echo"
-harness = false
-
-[[bench]]
 name    = "ws_framing"
 harness = false
 
 [[bench]]
-name    = "pool_ws_echo"
+name    = "ws_ingress_single"
 harness = false
 
 [[bench]]
-name    = "pool_fanout"
+name    = "ws_ingress_fanout"
 harness = false
 
 # ─── lints ──────────────────────────────────────────────────────────────

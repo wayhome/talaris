@@ -160,33 +160,24 @@ mod linux_impl {
                 common::pin_or_warn("fanout-client", user_cpu);
                 eprintln!("[pool_fanout] N={n_conns} starting");
 
-                let mut cfg_template = ConnectionConfig::new("localhost", addr.port(), "/echo")
+                let cfg_template = ConnectionConfig::new("localhost", addr.port(), "/echo")
                     .with_tls(false)
                     .with_sq_poll(10_000, Some(sq_poll_cpu));
                 let mut pool = Pool::new(PoolConfig::new(cfg_template.proactor)).expect("pool");
 
-                // 并发 submit N 条 connect
+                // 顺序 connect N 条。早期版本走 submit_connect_to + pump-until-Open
+                // 的并发路径，发现 Pool::pump() 不会 sync_ws_open_state（那是
+                // `pub(crate)`，只在 drive_conn_until_open 里调），导致状态永远停在
+                // WsHandshake → bench hang。等 lib 给 pump() 暴露 open-state sync
+                // 再改回并发。loopback 单 conn handshake ~1 ms，N=64 也就 64 ms 一次
+                // 性 setup，不影响 steady-state 测量。
                 let mut handles: Vec<ConnHandle> = Vec::with_capacity(n_conns as usize);
+                let connect_start = Instant::now();
                 for _ in 0..n_conns {
                     let cfg = cfg_template.clone();
-                    let h = pool.submit_connect_to(cfg, addr).expect("submit_connect");
+                    let h = pool.connect_blocking_to(cfg, addr).expect("connect");
+                    assert_eq!(pool.state(h), Some(State::Open));
                     handles.push(h);
-                }
-                cfg_template.proactor.entries = 0; // 防意外复用
-
-                // pump 直到全员 Open
-                let connect_start = Instant::now();
-                loop {
-                    pool.pump(|_, _| {}).expect("pump connect");
-                    let all_open = handles
-                        .iter()
-                        .all(|h| pool.state(*h) == Some(State::Open));
-                    if all_open {
-                        break;
-                    }
-                    if connect_start.elapsed() > std::time::Duration::from_secs(30) {
-                        panic!("connect timeout, fanout N={n_conns}");
-                    }
                 }
                 eprintln!(
                     "[pool_fanout] N={n_conns} all handshakes done in {:?}",

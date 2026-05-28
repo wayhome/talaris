@@ -1,0 +1,88 @@
+[package]
+name          = "talaris"
+version       = "0.1.0"
+edition       = "2024"
+license       = "GPL-3.0-or-later"
+authors       = ["fdranger <fdrangerhere@gmail.com>"]
+rust-version  = "1.95"
+publish       = true
+description   = "Low-latency and predictable-latency, zero-jitter HFT data-pipeline transport: io_uring proactor + self-implemented WS/TLS/HTTP."
+repository    = "https://github.com/fdrangersg/talaria"
+homepage      = "https://github.com/fdrangersg/talaria"
+documentation = "https://docs.rs/talaris"
+readme        = "README.md"
+keywords      = ["websocket", "io-uring", "tls", "network", "hft"]
+categories    = ["network-programming", "asynchronous"]
+
+[lib]
+name = "talaris"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror    = "2"
+ring         = "0.17"   # SystemRandom for Sec-WebSocket-Key
+sha1         = "0.10"   # Sec-WebSocket-Accept
+base64       = "0.22"
+rustls       = "0.23"
+webpki-roots = "0.26"
+tracing      = "0.1"
+# libc 提供 errno 常量（ENOBUFS / ECONNRESET 等）。跨平台 dep —— macOS 上仍可
+# compile（stub 路径不会真用到 errno match），让 cargo check 在所有平台都能
+# type-check Linux-only 的 connection_state / pool。
+libc         = "0.2"
+
+# hot-path proactor (Linux only — macOS 走 stub)
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring      = "0.7"
+core_affinity = "0.8"
+
+# example 用：pool_two_pub_streams 的 per-handle latency 测量
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+hdrhistogram = "7"
+
+# ─── profiles ───────────────────────────────────────────────────────────
+[profile.dev]
+opt-level = 0
+debug     = true
+
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+panic         = "abort"
+strip         = "symbols"
+debug         = false
+
+# 留给 perf / 火焰图：release 性能 + 调试符号
+[profile.release-debug]
+inherits = "release"
+strip    = false
+debug    = true
+
+[profile.bench]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+debug         = true
+
+# ─── lints ──────────────────────────────────────────────────────────────
+[lints.rust]
+unsafe_op_in_unsafe_fn        = "warn"
+unused_must_use               = "warn"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all                      = { level = "warn", priority = -1 }
+pedantic                 = { level = "warn", priority = -1 }
+nursery                  = { level = "warn", priority = -1 }
+unwrap_used              = "warn"
+expect_used              = "warn"
+indexing_slicing         = "warn"
+use_self                 = "warn"
+mem_forget               = "deny"
+todo                     = "warn"
+unimplemented            = "warn"
+panic                    = "warn"
+inline_always            = "allow"  # HFT hot path 自己控制 inline
+cast_possible_truncation = "warn"
+cast_sign_loss           = "warn"

@@ -3,27 +3,45 @@
 // ## 这层 bench 在测什么
 //
 // 给定 N ∈ {1, 4, 16, 64} 条 conn 共享一个 [`Pool`]：每轮 N 个 send 一起塞
-// 进 Pool（背靠背），pump 直到 N 个 echo 全回来；记录 round 内 per-conn 的
-// RTT（从"全员发出"到"本条 echo 拿到"）和整体吞吐 (msg/s)。
+// 进 Pool（背靠背），pump 直到 N 个 echo 全回来；记录 round 内 per-echo RTT
+// （从"全员发出"到"本条 echo 拿到"）和整体吞吐 (msg/s)。
 //
-// 这层重点验证的不是单 RTT 的绝对低延迟（那是 pool_ws_echo 的事），而是：
+// 重点不是单 RTT 绝对值（那是 pool_ws_echo 的事），而是：
 //
-// 1. **slot-table 路由** 的 N→1 衰减：CQE 拿到 token 解出 conn_id 是 O(1)，但
-//    实际 cache miss、bgid 切换、send_buf hand-over 的代价随 N 怎么走。
-// 2. **multishot rearm 摊销** 在多 conn 下能不能跟上：每条 conn 独占一个 bgid，
-//    N 大了 buffer ring 总占用变大，rearm 频率也变化。
-// 3. **send_binary 拥塞** 的处理：N 个 send 同帧 batch 进 SQ 时 SQ 容易满，看 Pool
-//    内部 backpressure 处理是否平滑。
+// 1. **slot-table 路由** 的 N→1 衰减：CQE token → conn_id 是 O(1)，但实际
+//    cache miss、bgid 切换、send_buf hand-over 的代价随 N 怎么走。
+// 2. **multishot rearm 摊销** 多 conn 下能不能跟上：每条 conn 独占一个 bgid。
+// 3. **send_binary 拥塞**：N 个 send 同帧 batch 进 SQ，SQ 满时 Pool 内部
+//    backpressure 处理是否平滑。
 //
-// ## 默认 N 序列
+// ## 严格控制变量
 //
-// `--n-list 1,4,16,64`（按需覆盖），每个 N 跑独立 server + 独立 Pool。
+// - **串行执行**：N=1 → unpin → server tear down → fresh server → N=4 → ...
+// - **数据量对齐**：每个 N 跑 `--iters` 个 round（默认 50_000）。可选 `--seconds`。
+// - **fresh listener + fresh server per N**：每个 N 起一个新 listener bind +
+//   新 server 线程，彻底隔离 N 之间的 socket / kernel state。
+// - **server 单 OS 线程**：使用 tokio current_thread runtime（不是 N 个线程）。
+//   server 端只占 1 个 CPU，client 测量不被 server-side 调度抖动污染。
+//   早期版本给每条 conn spawn 一条 OS 线程，N=64 时 64 个 server worker 抢 8
+//   个 CPU，把 client 测的尾延迟全淹了。
+//
+// ## 注意
+//
+// Pool::pump() 不调 `sync_ws_open_state`（那是 `pub(crate)`，只在
+// drive_conn_until_open 内调），所以并发 `submit_connect` + 用户 pump 直到 Open
+// 的非阻塞 handshake 用法目前 hang。fanout 这里走顺序 `connect_blocking_to`，
+// loopback 单 conn handshake ~1 ms，N=64 一次性 60ms 不影响 steady state。
+// 等 lib 层 fix。
 //
 // ## 运行
 //
 // ```bash
 // taskset -c 0-7 cargo bench --bench pool_fanout -- \
 //     --iters 50000 --warmup 5000 --payload 64 --n-list 1,4,16,64
+//
+// # wall-clock 对齐 throughput：
+// taskset -c 0-7 cargo bench --bench pool_fanout -- \
+//     --seconds 5 --payload 64 --n-list 1,4,16,64
 // ```
 
 #![allow(
@@ -56,20 +74,25 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 mod linux_impl {
-    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
-    use std::thread;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener};
     use std::time::Instant;
 
     use hdrhistogram::Histogram;
     use talaris::connection::{ConnectionConfig, State};
-    use talaris::proactor::unpin_current_thread;
     use talaris::ws::Event as WsEvent;
     use talaris::{ConnHandle, Pool, PoolConfig};
 
     use super::common;
+    use super::common::{PinGuard, StopMode};
+
+    struct Row {
+        n: u32,
+        hist: Histogram<u64>,
+        msgs_per_sec: f64,
+    }
 
     pub fn run() {
-        let iters: u64 = common::arg_or("--iters", 50_000);
+        let stop = StopMode::from_args(50_000);
         let warmup: u64 = common::arg_or("--warmup", 5_000);
         let payload: usize = common::arg_or("--payload", 64);
         let server_cpu: usize = common::arg_or("--server-cpu", 4);
@@ -81,177 +104,186 @@ mod linux_impl {
             .filter_map(|s| s.trim().parse().ok())
             .collect();
 
-        eprintln!(
-            "[pool_fanout] iters={iters} warmup={warmup} payload={payload}B \
-             n_list={ns:?} server-cpu={server_cpu} user-cpu={user_cpu} \
-             sq-poll-cpu={sq_poll_cpu}"
-        );
+        eprintln!("=========================================================");
+        eprintln!(" pool_fanout — Pool N-conn 路由 + 吞吐 scaling");
+        eprintln!("=========================================================");
+        eprintln!(" stop      : {}", stop.describe());
+        eprintln!(" warmup    : {warmup} (per N)");
+        eprintln!(" payload   : {payload}B");
+        eprintln!(" n-list    : {ns:?}");
+        eprintln!(" server-cpu: {server_cpu} (单 OS 线程 async, fresh per N)");
+        eprintln!(" user-cpu  : {user_cpu}");
+        eprintln!(" sq-poll-cpu: {sq_poll_cpu}");
+        eprintln!(" execution : 串行，inline on main thread，每 N 之间 unpin");
+        eprintln!();
 
-        let mut rows: Vec<(String, u64, u64, u64, u64, f64)> = Vec::new();
-        for &n in &ns {
-            let (hist, msgs_per_sec) =
-                run_for_n(n, iters, warmup, payload, server_cpu, user_cpu, sq_poll_cpu);
-            rows.push((
-                format!("N={n}"),
-                hist.mean() as u64,
-                hist.value_at_quantile(0.50),
-                hist.value_at_quantile(0.99),
-                hist.value_at_quantile(0.999),
+        let mut rows: Vec<Row> = Vec::new();
+        let n_total = ns.len();
+        for (idx, &n) in ns.iter().enumerate() {
+            eprintln!(
+                "─── variant {}/{}: N={n} ───",
+                idx + 1,
+                n_total
+            );
+            let (hist, msgs_per_sec) = with_fresh_async_server(server_cpu, n, |addr| {
+                run_fanout_n(n, addr, stop, warmup, payload, user_cpu, sq_poll_cpu)
+            });
+            rows.push(Row {
+                n,
+                hist,
                 msgs_per_sec,
-            ));
+            });
+            eprintln!();
         }
 
         println!();
-        println!("=== Pool fanout (payload={payload}B, iters/round={iters}) ===");
+        println!("=== Pool fanout (payload={payload}B) ===");
         println!(
-            "{:<8} {:>12} {:>12} {:>12} {:>14} {:>16}",
-            "conns", "mean(ns)", "p50(ns)", "p99(ns)", "p99.9(ns)", "msgs/sec"
+            "{:<8} {:>14} {:>14} {:>14} {:>14} {:>14} {:>16}",
+            "conns", "mean(ns)", "p50(ns)", "p99(ns)", "p99.9(ns)", "max(ns)", "msgs/sec"
         );
-        for (label, mean, p50, p99, p999, msgs) in &rows {
+        for r in &rows {
             println!(
-                "{:<8} {:>12} {:>12} {:>12} {:>14} {:>16}",
-                label,
-                fmt_int(*mean),
-                fmt_int(*p50),
-                fmt_int(*p99),
-                fmt_int(*p999),
-                fmt_int(*msgs as u64),
+                "N={:<6} {:>14} {:>14} {:>14} {:>14} {:>14} {:>16}",
+                r.n,
+                fmt_int(r.hist.mean() as u64),
+                fmt_int(r.hist.value_at_quantile(0.50)),
+                fmt_int(r.hist.value_at_quantile(0.99)),
+                fmt_int(r.hist.value_at_quantile(0.999)),
+                fmt_int(r.hist.max()),
+                fmt_int(r.msgs_per_sec as u64),
             );
         }
     }
 
-    fn run_for_n(
-        n_conns: u32,
-        iters: u64,
-        warmup: u64,
-        payload: usize,
+    /// Fresh single-threaded async WS echo server per N.
+    fn with_fresh_async_server<R>(
         server_cpu: usize,
-        user_cpu: usize,
-        sq_poll_cpu: u32,
-    ) -> (Histogram<u64>, f64) {
-        // ── server：一条 acceptor thread，accept N 个 conn 后给每条 conn 起
-        //    一个 echo worker thread（loop echo 直到 client 关）。
+        n_conns: u32,
+        body: impl FnOnce(SocketAddr) -> R,
+    ) -> R {
         let listener =
             TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).expect("bind");
         let addr = listener.local_addr().expect("local_addr");
-        let server_thread = thread::Builder::new()
-            .name(format!("fanout-srv-{n_conns}"))
-            .spawn(move || {
-                common::pin_or_warn("fanout-srv", server_cpu);
-                let mut workers = Vec::new();
-                for i in 0..n_conns {
-                    let (s, _) = listener.accept().expect("accept");
-                    let w = thread::Builder::new()
-                        .name(format!("ws-echo-{i}"))
-                        .spawn(move || common::run_ws_echo_session(s))
-                        .expect("spawn worker");
-                    workers.push(w);
-                }
-                for w in workers {
-                    let _ = w.join();
-                }
-            })
-            .expect("spawn srv");
+        let server =
+            common::spawn_ws_echo_server_multiplexed(listener, n_conns, Some(server_cpu));
+        eprintln!(
+            "[bench] fresh single-thread async WS server on {addr}, cpu={server_cpu}, n_conns={n_conns}"
+        );
+        let result = body(addr);
+        server.join().expect("server thread panic");
+        result
+    }
 
-        // ── client：pin + 起 Pool + 并发 submit_connect N 条 → pump 到全 Open。
-        let client = thread::Builder::new()
-            .name(format!("fanout-client-{n_conns}"))
-            .spawn(move || {
-                common::pin_or_warn("fanout-client", user_cpu);
-                eprintln!("[pool_fanout] N={n_conns} starting");
+    fn run_fanout_n(
+        n_conns: u32,
+        addr: SocketAddr,
+        stop: StopMode,
+        warmup: u64,
+        payload: usize,
+        user_cpu: usize,
+        sq_poll_cpu: u32,
+    ) -> (Histogram<u64>, f64) {
+        let _guard = PinGuard::pin("fanout-client", user_cpu);
+        eprintln!("[fanout N={n_conns}] user→CPU {user_cpu}, SQ_POLL→CPU {sq_poll_cpu}");
 
-                let cfg_template = ConnectionConfig::new("localhost", addr.port(), "/echo")
-                    .with_tls(false)
-                    .with_sq_poll(10_000, Some(sq_poll_cpu));
-                let mut pool = Pool::new(PoolConfig::new(cfg_template.proactor)).expect("pool");
+        let cfg_template = ConnectionConfig::new("localhost", addr.port(), "/echo")
+            .with_tls(false)
+            .with_sq_poll(10_000, Some(sq_poll_cpu));
+        let mut pool = Pool::new(PoolConfig::new(cfg_template.proactor)).expect("pool");
 
-                // 顺序 connect N 条。早期版本走 submit_connect_to + pump-until-Open
-                // 的并发路径，发现 Pool::pump() 不会 sync_ws_open_state（那是
-                // `pub(crate)`，只在 drive_conn_until_open 里调），导致状态永远停在
-                // WsHandshake → bench hang。等 lib 给 pump() 暴露 open-state sync
-                // 再改回并发。loopback 单 conn handshake ~1 ms，N=64 也就 64 ms 一次
-                // 性 setup，不影响 steady-state 测量。
-                let mut handles: Vec<ConnHandle> = Vec::with_capacity(n_conns as usize);
-                let connect_start = Instant::now();
-                for _ in 0..n_conns {
-                    let cfg = cfg_template.clone();
-                    let h = pool.connect_blocking_to(cfg, addr).expect("connect");
-                    assert_eq!(pool.state(h), Some(State::Open));
-                    handles.push(h);
-                }
-                eprintln!(
-                    "[pool_fanout] N={n_conns} all handshakes done in {:?}",
-                    connect_start.elapsed()
-                );
+        // 顺序 connect N 条（Pool::pump 不 sync open-state，非阻塞并发 handshake
+        // 走不通）。loopback 上每条 ~1 ms。
+        let mut handles: Vec<ConnHandle> = Vec::with_capacity(n_conns as usize);
+        let connect_start = Instant::now();
+        for _ in 0..n_conns {
+            let h = pool
+                .connect_blocking_to(cfg_template.clone(), addr)
+                .expect("connect");
+            assert_eq!(pool.state(h), Some(State::Open));
+            handles.push(h);
+        }
+        eprintln!(
+            "[fanout N={n_conns}] {n_conns} handshakes done in {:?}",
+            connect_start.elapsed()
+        );
 
-                let mut payload_buf = vec![0_u8; payload];
-                for (i, b) in payload_buf.iter_mut().enumerate() {
-                    *b = b'a' + ((i % 26) as u8);
-                }
+        let mut payload_buf = vec![0_u8; payload];
+        for (i, b) in payload_buf.iter_mut().enumerate() {
+            *b = b'a' + ((i % 26) as u8);
+        }
 
-                let mut hist = common::new_hist();
-                let total = iters + warmup;
-                let bench_start = Instant::now();
+        // ── warmup ──
+        let mut seq = 0_u64;
+        for _ in 0..warmup {
+            one_fanout_round(&mut pool, &handles, &mut payload_buf, seq, None);
+            seq += 1;
+        }
 
-                for iter in 0..total {
-                    payload_buf[..8].copy_from_slice(&iter.to_le_bytes());
+        // ── measure ──
+        let mut hist = common::new_hist();
+        let bench_start = Instant::now();
+        let mut iter = 0_u64;
+        while stop.keep_going(iter, bench_start) {
+            one_fanout_round(&mut pool, &handles, &mut payload_buf, seq, Some(&mut hist));
+            seq += 1;
+            iter += 1;
+        }
+        let wall = bench_start.elapsed();
+        let total_msgs = iter as f64 * f64::from(n_conns);
+        let msgs_per_sec = total_msgs / wall.as_secs_f64();
+        eprintln!(
+            "[fanout N={n_conns}] {iter} rounds × {n_conns} msgs in {:.3}s = {:.0} msg/s",
+            wall.as_secs_f64(),
+            msgs_per_sec
+        );
 
-                    let round_t0 = Instant::now();
-                    for &h in &handles {
-                        pool.send_binary(h, &payload_buf).expect("send");
-                    }
-
-                    let mut got = 0_u32;
-                    while got < n_conns {
-                        pool.pump(|_h, ev| {
-                            if let WsEvent::Binary(data) = ev {
-                                assert_eq!(
-                                    &data[..8],
-                                    &iter.to_le_bytes(),
-                                    "seq mismatch in fanout iter {iter}"
-                                );
-                                got += 1;
-                                if iter >= warmup {
-                                    let dt = round_t0.elapsed();
-                                    common::record_ns(&mut hist, dt);
-                                }
-                            }
-                        })
-                        .expect("pump");
-                    }
-                }
-                let bench_elapsed = bench_start.elapsed();
-                let measured_iters = iters; // warmup 段不算在吞吐里
-                let total_msgs = measured_iters as f64 * f64::from(n_conns);
-                // 减掉 warmup 占用的时间近似：用 bench 总时间 × (measured / total) 反推
-                // 不必精确——只为给量级感
-                let measured_secs = bench_elapsed.as_secs_f64()
-                    * (measured_iters as f64 / total as f64);
-                let msgs_per_sec = total_msgs / measured_secs;
-
-                // 关闭所有 conn
-                for &h in &handles {
-                    pool.initiate_close(h, 1000, "bye").ok();
-                }
-                let close_start = Instant::now();
-                while close_start.elapsed() < std::time::Duration::from_secs(2) {
-                    let _ = pool.pump_nowait(|_, _| {});
-                    let all_closed = handles
-                        .iter()
-                        .all(|h| matches!(pool.state(*h), Some(State::Closed)));
-                    if all_closed {
-                        break;
-                    }
-                }
-
-                let _ = unpin_current_thread();
-                (hist, msgs_per_sec)
-            })
-            .expect("spawn client");
-
-        let (hist, msgs_per_sec) = client.join().expect("client panic");
-        server_thread.join().expect("server panic");
+        // close
+        for &h in &handles {
+            pool.initiate_close(h, 1000, "bye").ok();
+        }
+        let close_start = Instant::now();
+        while close_start.elapsed() < std::time::Duration::from_secs(2) {
+            let _ = pool.pump_nowait(|_, _| {});
+            let all_closed = handles
+                .iter()
+                .all(|h| matches!(pool.state(*h), Some(State::Closed)));
+            if all_closed {
+                break;
+            }
+        }
         (hist, msgs_per_sec)
+    }
+
+    /// 一轮 fanout：N 个 send 批量入 SQ → pump 收 N 个 echo。
+    /// `hist = Some` 时每条 echo 完成都 record 一条 sample；`None` 是 warmup phase。
+    #[inline(always)]
+    fn one_fanout_round(
+        pool: &mut Pool,
+        handles: &[ConnHandle],
+        payload_buf: &mut [u8],
+        seq: u64,
+        mut hist: Option<&mut Histogram<u64>>,
+    ) {
+        payload_buf[..8].copy_from_slice(&seq.to_le_bytes());
+        let round_t0 = Instant::now();
+        for &h in handles {
+            pool.send_binary(h, payload_buf).expect("send");
+        }
+        let mut got = 0_u32;
+        let n = handles.len() as u32;
+        while got < n {
+            pool.pump(|_h, ev| {
+                if let WsEvent::Binary(data) = ev {
+                    assert_eq!(&data[..8], &seq.to_le_bytes(), "fanout seq mismatch");
+                    got += 1;
+                    if let Some(ref mut h) = hist {
+                        common::record_ns(h, round_t0.elapsed());
+                    }
+                }
+            })
+            .expect("pump");
+        }
     }
 
     fn fmt_int(n: u64) -> String {

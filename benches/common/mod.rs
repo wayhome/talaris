@@ -1,4 +1,5 @@
-// 多个 bench 共享代码 —— histogram 打印、CLI 解析、in-process WS echo server。
+// 多个 bench 共享代码 —— histogram 打印、CLI 解析、in-process echo server、
+// PinGuard、StopCondition。
 //
 // 不是 Cargo bench target（住在子目录里，cargo 不会自动收作 target）；每个 bench
 // 文件用 `#[path = "common/mod.rs"] mod common;` 引进来。
@@ -24,29 +25,27 @@
     clippy::semicolon_if_nothing_returned
 )]
 
+use std::time::Instant;
+
 use hdrhistogram::Histogram;
 
 // ─── HdrHistogram helper ────────────────────────────────────────────────
 
 /// 一个延迟 bench 通用的 histogram bound：1 ns … 60 s, 3 位有效数字。
-///
-/// 60 s 上界是为了"假死"的 outlier 也不丢；HdrHistogram 实际存储是 bucket，
-/// 上界开得高也不消耗多少内存（log 增长）。
 pub fn new_hist() -> Histogram<u64> {
     Histogram::new_with_bounds(1, 60_000_000_000, 3).expect("hist")
 }
 
-/// 把一个 `std::time::Duration` 安全转 ns 喂给 hist.record。负数（不可能）/
-/// 0（hist 拒收）做防御性 clamp 到 1。
+/// 把 `Duration` 安全转 ns 喂给 hist.record。
 pub fn record_ns(hist: &mut Histogram<u64>, dt: std::time::Duration) {
     let ns = u64::try_from(dt.as_nanos().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
     hist.record(ns.max(1)).ok();
 }
 
-/// 单 histogram 单行打印。给单 variant bench 用。
+/// 单 histogram 单行打印。
 pub fn print_hist(label: &str, h: &Histogram<u64>) {
     println!(
-        "{:<20} mean={:>10}  p50={:>10}  p99={:>10}  p99.9={:>10}  max={:>10}  n={}",
+        "{:<24}  mean={:>10}  p50={:>10}  p99={:>10}  p99.9={:>10}  max={:>10}  n={}",
         label,
         ns(h.mean() as u64),
         ns(h.value_at_quantile(0.50)),
@@ -57,8 +56,7 @@ pub fn print_hist(label: &str, h: &Histogram<u64>) {
     );
 }
 
-/// 多 variant 并列：用于 talaris vs tokio / SQ_POLL on/off 等对照。
-/// 第一个 entry 当作 baseline，其它列出 ratio = baseline / self。
+/// 多 variant 并列。
 pub fn print_comparison(rows: &[(&str, &Histogram<u64>)]) {
     if rows.is_empty() {
         return;
@@ -73,46 +71,31 @@ pub fn print_comparison(rows: &[(&str, &Histogram<u64>)]) {
 
     print!("{:<10}", "metric");
     for (label, _) in rows {
-        print!(" │ {label:>16}");
-    }
-    if rows.len() > 1 {
-        print!(" │ ratio vs first");
+        print!(" │ {label:>18}");
     }
     println!();
-
-    print!("{:<10}", "─".repeat(10));
+    print!("{}", "─".repeat(10));
     for _ in rows {
-        print!("─┼─{:>16}", "─".repeat(16));
-    }
-    if rows.len() > 1 {
-        print!("─┼─{:>14}", "─".repeat(14));
+        print!("─┼─{}", "─".repeat(18));
     }
     println!();
 
     for (col_name, extract) in cols {
         print!("{col_name:<10}");
-        let mut first: Option<u64> = None;
         for (_, h) in rows {
-            let v = extract(h);
-            print!(" │ {:>16}", ns(v));
-            if first.is_none() {
-                first = Some(v);
-            }
-        }
-        if rows.len() > 1 {
-            // ratio: 后面 variant 相对第一个的倍率（>1 = 慢；<1 = 快）。这里
-            // 只展示最后一个 variant 的 ratio，多个 variant 时按需扩展。
-            let (_, last_h) = rows[rows.len() - 1];
-            let last = extract(last_h);
-            let first = first.unwrap_or(1).max(1);
-            print!(" │ {:>13.2}×", last as f64 / first as f64);
+            print!(" │ {:>18}", ns(extract(h)));
         }
         println!();
     }
-    println!("samples: {:?}", rows.iter().map(|(_, h)| h.len()).collect::<Vec<_>>());
+    println!(
+        "samples : {}",
+        rows.iter()
+            .map(|(l, h)| format!("{l}={}", h.len()))
+            .collect::<Vec<_>>()
+            .join("  ")
+    );
 }
 
-/// 把 ns 加千分位逗号格式化成 "1,234,567 ns"
 fn ns(n: u64) -> String {
     let s = n.to_string();
     let bytes = s.as_bytes();
@@ -128,10 +111,7 @@ fn ns(n: u64) -> String {
 }
 
 // ─── CLI 解析 ───────────────────────────────────────────────────────────
-//
-// 不引入 clap —— bench 是给开发者跑的，5 个 flag 一个 while-loop 搞定。
 
-/// 提取 `--key value` 形式的 flag。多次出现取最后一个。返回 None 表示用户没传。
 pub fn arg_opt<T: std::str::FromStr>(key: &str) -> Option<T> {
     let mut it = std::env::args().skip(1);
     let mut found: Option<T> = None;
@@ -149,23 +129,106 @@ pub fn arg_or<T: std::str::FromStr + Clone>(key: &str, default: T) -> T {
     arg_opt(key).unwrap_or(default)
 }
 
-// ─── 线程 pin（带 warn fallback）───────────────────────────────────────
+// ─── Stop condition：iter 数或 wall-clock 二选一 ─────────────────────────
+//
+// 严格控制变量的核心：所有 variant 在同一个 stop condition 下跑。
+//
+// - `--iters N`（默认）：每 variant 跑 N 次 round（数据量对齐）。延迟比较的标准
+//   做法。注意：更快的 variant 用时更短，wall-clock 不齐。
+// - `--seconds T`：每 variant 跑 T 秒（wall-clock 对齐）。throughput 比较用，
+//   慢的 variant 完成的 iter 数变少，但每条 sample 仍是同一段时钟下的"系统
+//   稳态"，比 iter-aligned 抗 thermal / IRQ drift。
+//
+// 不允许同时给，互相矛盾。
 
-#[cfg(target_os = "linux")]
-pub fn pin_or_warn(label: &str, cpu: usize) {
-    if let Err(e) = talaris::proactor::pin_current_thread_to(cpu) {
-        eprintln!("[{label}] pin to CPU {cpu} failed: {e}; continuing unpinned");
+#[derive(Debug, Clone, Copy)]
+pub enum StopMode {
+    Iters(u64),
+    Seconds(f64),
+}
+
+impl StopMode {
+    /// Default iters 由 caller bench 给（不同 bench 量级差很多）。
+    pub fn from_args(default_iters: u64) -> Self {
+        let secs: Option<f64> = arg_opt("--seconds");
+        let iters: Option<u64> = arg_opt("--iters");
+        match (secs, iters) {
+            (Some(_), Some(_)) => {
+                eprintln!(
+                    "[bench] --seconds and --iters both given; using --seconds (wall-clock aligned)"
+                );
+                Self::Seconds(secs.unwrap())
+            }
+            (Some(s), None) => Self::Seconds(s),
+            (None, Some(i)) => Self::Iters(i),
+            (None, None) => Self::Iters(default_iters),
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Iters(n) => format!("iters={n}"),
+            Self::Seconds(s) => format!("seconds={s}"),
+        }
+    }
+
+    /// 主循环 predicate：iter 数和起始时间，决定要不要继续下一轮。
+    pub fn keep_going(&self, iter: u64, started: Instant) -> bool {
+        match *self {
+            Self::Iters(n) => iter < n,
+            Self::Seconds(s) => started.elapsed().as_secs_f64() < s,
+        }
     }
 }
 
-// ─── 通用 TCP echo server（bytes-in → bytes-out 循环到 peer 关）───────
+// ─── PinGuard：作用域期间钉 CPU，drop 时还原（unpin 到全 CPU mask）─────
+//
+// 让 variant function 末尾不会忘记 unpin —— 跨 variant 串行跑时，前一个
+// variant 的 affinity 不能影响下一个。
+
+#[derive(Debug)]
+pub struct PinGuard;
+
+#[cfg(target_os = "linux")]
+impl PinGuard {
+    /// 钉当前线程到 `cpu`；返回的 guard drop 时还原 affinity。失败仅 warn，
+    /// 不 panic（bench 还能跑，只是 baseline 偏移）。
+    #[must_use]
+    pub fn pin(label: &str, cpu: usize) -> Self {
+        if let Err(e) = talaris::proactor::pin_current_thread_to(cpu) {
+            eprintln!("[{label}] pin to CPU {cpu} failed: {e}; continuing unpinned");
+        }
+        Self
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PinGuard {
+    fn drop(&mut self) {
+        let _ = talaris::proactor::unpin_current_thread();
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl PinGuard {
+    #[must_use]
+    pub fn pin(_label: &str, _cpu: usize) -> Self {
+        Self
+    }
+}
+
+/// 当 `cpu.is_some()` 时 pin，否则不 pin 也返回一个 noop guard（统一类型）。
+#[cfg(target_os = "linux")]
+pub fn pin_optional(label: &str, cpu: Option<usize>) -> Option<PinGuard> {
+    cpu.map(|c| PinGuard::pin(label, c))
+}
+
+// ─── Sync TCP echo server（单 conn / 单 OS 线程，bench 用一次性 session）
 
 #[cfg(target_os = "linux")]
 pub fn run_tcp_echo_once(listener: std::net::TcpListener, cpu: Option<usize>) {
     use std::io::{Read, Write};
-    if let Some(cpu) = cpu {
-        pin_or_warn("tcp-echo", cpu);
-    }
+    let _g = cpu.map(|c| PinGuard::pin("tcp-echo", c));
     let (mut s, _) = listener.accept().expect("accept");
     s.set_nodelay(true).expect("nodelay");
     let mut buf = vec![0_u8; 256 * 1024];
@@ -182,42 +245,7 @@ pub fn run_tcp_echo_once(listener: std::net::TcpListener, cpu: Option<usize>) {
     }
 }
 
-/// 连续 echo `sessions` 个 client；用于一个 server 顺序服务多个 variant。
-#[cfg(target_os = "linux")]
-pub fn run_tcp_echo_sessions(
-    listener: std::net::TcpListener,
-    cpu: Option<usize>,
-    sessions: u32,
-) {
-    use std::io::{Read, Write};
-    if let Some(cpu) = cpu {
-        pin_or_warn("tcp-echo", cpu);
-    }
-    for _ in 0..sessions {
-        let (mut s, _) = listener.accept().expect("accept");
-        s.set_nodelay(true).expect("nodelay");
-        let mut buf = vec![0_u8; 256 * 1024];
-        loop {
-            match s.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if s.write_all(&buf[..n]).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    }
-}
-
-// ─── 通用 WS echo server（loop echo 直到 peer 发 Close 或 EOF）─────────
-//
-// 直接用 talaris 自己暴露的 frame / handshake / mask helper。pool_ws_echo 和
-// pool_fanout 都用这套。
-//
-// 协议覆盖：HTTP upgrade → 循环 (read masked Text/Binary/Ping → echo same opcode
-// 不 mask；read Close → echo Close → return)；fragmented frame 不支持。
+// ─── Sync WS echo server（单 conn / 单 OS 线程）────────────────────────
 
 #[cfg(target_os = "linux")]
 pub fn run_ws_echo_session(mut s: std::net::TcpStream) {
@@ -236,7 +264,7 @@ pub fn run_ws_echo_session(mut s: std::net::TcpStream) {
     loop {
         let (opcode, payload) = match read_frame(&mut s) {
             Some(x) => x,
-            None => return, // peer EOF
+            None => return,
         };
         match opcode {
             OpCode::Text | OpCode::Binary | OpCode::Ping => {
@@ -254,18 +282,15 @@ pub fn run_ws_echo_session(mut s: std::net::TcpStream) {
                 }
             }
             OpCode::Close => {
-                // echo Close (code 1000) then bail
                 let hn = encode_header(&mut header_buf, true, OpCode::Close, None, 2);
                 let _ = s.write_all(&header_buf[..hn]);
                 let _ = s.write_all(&1000_u16.to_be_bytes());
                 return;
             }
-            OpCode::Pong | OpCode::Continuation => {
-                // 不期望 client 发这两个；忽略
-            }
+            OpCode::Pong | OpCode::Continuation => {}
         }
     }
-    // helper 直接 inline 在 fn 内，避免外露
+
     #[inline]
     fn upgrade_ws(s: &mut std::net::TcpStream) {
         use std::io::Read;
@@ -297,7 +322,6 @@ pub fn run_ws_echo_session(mut s: std::net::TcpStream) {
     }
 }
 
-/// 读 1 个 client→server 帧（masked）。EOF / 任何 IO 错误返回 None。
 #[cfg(target_os = "linux")]
 pub fn read_frame(stream: &mut std::net::TcpStream) -> Option<(talaris::ws::OpCode, Vec<u8>)> {
     use std::io::Read;
@@ -346,23 +370,153 @@ pub fn read_frame(stream: &mut std::net::TcpStream) -> Option<(talaris::ws::OpCo
     Some((opcode, payload))
 }
 
-/// 起一个 WS echo server 线程，accept `sessions` 个 client 后退出。
+// ─── Async WS echo server（单 OS 线程驱动 N 条 conn，tokio current_thread）
+//
+// 给 pool_fanout 用。N 大（64+）时也只占用 1 个 CPU，client 端测量不被
+// server-side 调度抖动污染。
+
 #[cfg(target_os = "linux")]
-pub fn spawn_ws_echo_server(
-    listener: std::net::TcpListener,
+pub fn spawn_ws_echo_server_multiplexed(
+    std_listener: std::net::TcpListener,
+    n_conns: u32,
     cpu: Option<usize>,
-    sessions: u32,
 ) -> std::thread::JoinHandle<()> {
+    // tokio::net::TcpListener::from_std 要求 std listener 是 non-blocking
+    std_listener
+        .set_nonblocking(true)
+        .expect("set_nonblocking on listener");
+
     std::thread::Builder::new()
-        .name("bench-ws-echo".into())
+        .name("ws-echo-mplex".into())
         .spawn(move || {
-            if let Some(cpu) = cpu {
-                pin_or_warn("ws-echo", cpu);
-            }
-            for _ in 0..sessions {
-                let (s, _) = listener.accept().expect("accept");
-                run_ws_echo_session(s);
-            }
+            let _g = cpu.map(|c| PinGuard::pin("ws-echo-mplex", c));
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .build()
+                .expect("rt");
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(std_listener)
+                    .expect("tokio listener from std");
+                let mut sessions = Vec::with_capacity(n_conns as usize);
+                for _ in 0..n_conns {
+                    let (stream, _) = listener.accept().await.expect("accept");
+                    sessions.push(tokio::spawn(ws_echo_session_async(stream)));
+                }
+                for j in sessions {
+                    let _ = j.await;
+                }
+            });
         })
-        .expect("spawn ws-echo")
+        .expect("spawn ws-echo-mplex")
+}
+
+#[cfg(target_os = "linux")]
+async fn ws_echo_session_async(mut s: tokio::net::TcpStream) {
+    use talaris::ws::OpCode;
+    use talaris::ws::frame::{MAX_HEADER_LEN, encode_header};
+    use talaris::ws::handshake::compute_accept;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let _ = s.set_nodelay(true);
+
+    // 1. HTTP upgrade
+    let mut buf = [0_u8; 4096];
+    let mut req = Vec::<u8>::new();
+    loop {
+        let n = match s.read(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => n,
+        };
+        req.extend_from_slice(&buf[..n]);
+        if req.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let req_str = match std::str::from_utf8(&req) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let key = match req_str
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("sec-websocket-key:"))
+        .and_then(|l| l.split(':').nth(1))
+    {
+        Some(k) => k.trim().to_owned(),
+        None => return,
+    };
+    let accept = compute_accept(&key);
+    let resp = format!(
+        "HTTP/1.1 101 Switching Protocols\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {accept}\r\n\r\n"
+    );
+    if s.write_all(resp.as_bytes()).await.is_err() {
+        return;
+    }
+
+    // 2. echo loop
+    let mut header_buf = vec![0_u8; MAX_HEADER_LEN];
+    loop {
+        let mut hdr = [0_u8; 2];
+        if s.read_exact(&mut hdr).await.is_err() {
+            return;
+        }
+        let fin = (hdr[0] & 0x80) != 0;
+        if !fin {
+            return; // fragments not supported
+        }
+        let opcode_raw = hdr[0] & 0x0F;
+        let masked = (hdr[1] & 0x80) != 0;
+        let len_field = hdr[1] & 0x7F;
+        let payload_len: usize = if len_field < 126 {
+            usize::from(len_field)
+        } else if len_field == 126 {
+            let mut b = [0_u8; 2];
+            if s.read_exact(&mut b).await.is_err() {
+                return;
+            }
+            usize::from(u16::from_be_bytes(b))
+        } else {
+            let mut b = [0_u8; 8];
+            if s.read_exact(&mut b).await.is_err() {
+                return;
+            }
+            match usize::try_from(u64::from_be_bytes(b)) {
+                Ok(v) => v,
+                Err(_) => return,
+            }
+        };
+        let mut mask = [0_u8; 4];
+        if masked && s.read_exact(&mut mask).await.is_err() {
+            return;
+        }
+        let mut payload = vec![0_u8; payload_len];
+        if s.read_exact(&mut payload).await.is_err() {
+            return;
+        }
+        if masked {
+            talaris::ws::mask::mask_inplace(&mut payload, mask);
+        }
+
+        let echo_op = match opcode_raw {
+            0x1 => OpCode::Text,
+            0x2 => OpCode::Binary,
+            0x9 => OpCode::Pong, // Ping → Pong
+            0x8 => {
+                let hn = encode_header(&mut header_buf, true, OpCode::Close, None, 2);
+                let _ = s.write_all(&header_buf[..hn]).await;
+                let _ = s.write_all(&1000_u16.to_be_bytes()).await;
+                return;
+            }
+            _ => return,
+        };
+        let hn = encode_header(&mut header_buf, true, echo_op, None, payload.len() as u64);
+        if s.write_all(&header_buf[..hn]).await.is_err() {
+            return;
+        }
+        if s.write_all(&payload).await.is_err() {
+            return;
+        }
+    }
 }

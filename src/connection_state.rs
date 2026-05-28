@@ -252,6 +252,36 @@ impl ConnectionState {
         }
     }
 
+    /// fast-path 版本：plain TCP + Open 状态下，Recv CQE 直接走
+    /// [`WsClient::feed_binary_zero_copy`]，跳过 recv_buf memcpy。其它 CQE 走
+    /// 一般路径。TLS 路径不走 fast-path（TLS adapter 必须先收完整密文才能解出
+    /// 明文 frame，跳过 recv_buf 没意义），降回 `feed_recv`，由 caller 在
+    /// `pump_binary_impl` 末尾 `drain_binary_frames` 兜底。
+    pub(crate) fn handle_completion_binary<F>(
+        &mut self,
+        proactor: &mut Proactor,
+        c: Completion,
+        sink: F,
+    ) -> Result<(), ConnectionError>
+    where
+        F: FnMut(&[u8]),
+    {
+        let kind = c
+            .user_data
+            .kind()
+            .ok_or_else(|| ConnectionError::UnknownOpKind(c.user_data.raw()))?;
+        match kind {
+            OpKind::Connect => self.on_connect_cqe(proactor, c),
+            OpKind::Send => self.on_send_cqe(c),
+            OpKind::Recv => self.on_recv_cqe_binary(c, sink),
+            OpKind::Close => {
+                self.state = State::Closed;
+                Ok(())
+            }
+            OpKind::Nop => Ok(()),
+        }
+    }
+
     fn on_connect_cqe(&mut self, proactor: &mut Proactor, c: Completion) -> Result<(), ConnectionError> {
         c.to_result().map_err(ConnectionError::ConnectFailed)?;
 
@@ -370,6 +400,99 @@ impl ConnectionState {
         } else {
             self.ws.feed_recv(bytes);
             Ok::<_, ConnectionError>(())
+        };
+
+        self.buf_ring.as_mut().expect("buf_ring").recycle(bid);
+
+        recv_result
+    }
+
+    /// `on_recv_cqe` 的 fast-path 版：plain TCP + Open 状态下，直接把 kernel
+    /// buf_ring entry slice 喂给 [`WsClient::feed_binary_zero_copy`]，sink 在
+    /// 这个调用栈里同步触发，**不进 `recv_buf`，不存中转 memcpy**。
+    ///
+    /// TLS 路径 / 非 Open 状态降回 `feed_recv`（caller 之后用 drain 兜底）。
+    fn on_recv_cqe_binary<F>(
+        &mut self,
+        c: Completion,
+        sink: F,
+    ) -> Result<(), ConnectionError>
+    where
+        F: FnMut(&[u8]),
+    {
+        if !c.has_more() {
+            self.multishot_armed = false;
+        }
+
+        let Some(bid) = c.buffer_id() else {
+            return match c.to_result() {
+                Ok(0) => {
+                    self.state = State::Closed;
+                    Err(ConnectionError::PeerClosed)
+                }
+                Ok(_) => Ok(()),
+                Err(e) if is_recv_buffer_ring_exhausted(&e) => {
+                    self.multishot_armed = false;
+                    tracing::warn!(
+                        conn_id = self.cfg.conn_id,
+                        bgid = self.buf_ring.as_ref().map_or(0, BufferRing::bgid),
+                        "recv multishot provided-buffer ring exhausted (binary fast-path); will rearm"
+                    );
+                    Ok(())
+                }
+                Err(e) => Err(ConnectionError::RecvFailed(e)),
+            };
+        };
+
+        let n = c.to_result().map_err(ConnectionError::RecvFailed)?;
+
+        if n == 0 {
+            self.buf_ring.as_mut().expect("buf_ring").recycle(bid);
+            self.state = State::Closed;
+            return Err(ConnectionError::PeerClosed);
+        }
+
+        // Raw pointer split borrow（详见 connection.rs 模块文档同名段落）。
+        let bytes_ptr = self.buf_ring.as_ref().expect("buf_ring").buffer(bid).as_ptr();
+        // SAFETY: Proactor !Sync + recycle 排在最后 + buf_storage 是 Box<[u8]>。
+        let bytes: &[u8] = unsafe { std::slice::from_raw_parts(bytes_ptr, n) };
+
+        let recv_result: Result<(), ConnectionError> = if self.tls.is_some() {
+            // TLS 路径无 zero-copy 收益：rustls 必须自己累加密文。降回 feed_recv
+            // 链路；caller 在 pump_binary_impl 末尾 drain_binary_frames 把帧吐出来。
+            self.plain_buf.clear();
+            if let Some(tls) = &mut self.tls {
+                tls.ingest_ciphertext(bytes, &mut self.plain_buf, &mut self.tls_pending_out)?;
+                if !self.plain_buf.is_empty() {
+                    self.ws.feed_recv(&self.plain_buf);
+                }
+                if !tls.is_handshaking()
+                    && matches!(self.state, State::TlsHandshake)
+                    && !self.ws_handshake_begun
+                {
+                    tls.verify_alpn()?;
+                    self.state = State::WsHandshake;
+                    self.ws.begin_handshake();
+                    self.ws_handshake_begun = true;
+                }
+                if tls.received_close_notify()
+                    && !matches!(self.state, State::Closed | State::Closing)
+                {
+                    self.state = State::Closing;
+                }
+            }
+            Ok(())
+        } else if matches!(self.state, State::Open) {
+            // 走 zero-copy fast path —— sink 在这条调用栈里同步触发
+            self.ws
+                .feed_binary_zero_copy(bytes, sink)
+                .map(|_| ())
+                .map_err(ConnectionError::Ws)
+        } else {
+            // plain 但还没 Open（handshake 阶段）—— 走 feed_recv 让通用 path 处理
+            // upgrade response；之后 caller 通过 sync_ws_open_state 推进。
+            self.ws.feed_recv(bytes);
+            Ok(())
         };
 
         self.buf_ring.as_mut().expect("buf_ring").recycle(bid);

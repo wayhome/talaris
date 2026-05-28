@@ -165,6 +165,13 @@ pub struct WsClient {
     /// CSPRNG handle。`SystemRandom::new()` 是 cheap（thread-local），但仍然
     /// 持久化以表达"这条 ws 的 mask key 来源固定"的语义。
     mask_rng: ring::rand::SystemRandom,
+    /// 跨 [`feed_binary_zero_copy`](Self::feed_binary_zero_copy) 调用边界的部分
+    /// 帧字节。fast-path inbound 用：当一个 frame 在两个 kernel buf_ring entry
+    /// 的边界处被切断，把残尾留在这里，下一次 feed 拼回去解。
+    ///
+    /// 稳态下大概率是空的（典型 64B 帧 / 4KiB buffer 每 buffer 62 个完整帧 + ≤66B
+    /// 残尾），所以保留 256B 初始容量摊薄 vec realloc。
+    binary_remainder: Vec<u8>,
 }
 
 /// 一次 refill 装 64 个 mask key（256 字节）。对应 ~64 帧的 mask 预算 —— 即使
@@ -202,6 +209,7 @@ impl WsClient {
             mask_pool,
             mask_pool_cursor: 0,
             mask_rng,
+            binary_remainder: Vec::with_capacity(256),
         })
     }
 
@@ -288,26 +296,8 @@ impl WsClient {
                 }
             };
 
-            // 2) Fast-path 守门：非 FIN-Binary-unmasked 立刻退出 + 关连接
-            if !hdr.fin {
-                self.queue_close(CloseCode::ProtocolError.as_u16(), "fast-path: fragmented");
-                return Err(WsError::Protocol("drain_binary_frames: fragmented frame"));
-            }
-            if hdr.opcode != OpCode::Binary {
-                self.queue_close(CloseCode::ProtocolError.as_u16(), "fast-path: non-binary");
-                return Err(WsError::Protocol("drain_binary_frames: non-Binary opcode"));
-            }
-            if hdr.mask.is_some() {
-                self.queue_close(
-                    CloseCode::ProtocolError.as_u16(),
-                    "server sent masked frame",
-                );
-                return Err(WsError::Frame(FrameError::ServerSentMaskedFrame));
-            }
-            if hdr.payload_len > self.config.max_frame_payload {
-                self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
-                return Err(WsError::MessageTooLarge);
-            }
+            // 2) Fast-path 守门
+            self.fast_path_check(&hdr)?;
 
             let payload_len = hdr.payload_len as usize;
             let frame_total = header_size + payload_len;
@@ -324,6 +314,143 @@ impl WsClient {
             total_consumed += frame_total;
         }
         Ok(total_consumed)
+    }
+
+    /// **Zero-copy fast path** —— 直接吃 kernel buf_ring entry slice，不进
+    /// `recv_buf` 中转。partial frame（buffer 边界恰好切到帧中间）留在
+    /// [`binary_remainder`](Self::binary_remainder) 等下一次 feed 拼回去。
+    ///
+    /// 跟 [`drain_binary_frames`](Self::drain_binary_frames) 的 fast-path 守门
+    /// 规则一样：任何非 FIN-Binary-unmasked 帧都 protocol error。
+    ///
+    /// **不与 [`feed_recv`](Self::feed_recv) 混用** —— 一旦走过 feed_recv，
+    /// `recv_buf` 里堆的字节 zero-copy 路径不会去消化。混用前请先把
+    /// `drain_binary_frames` / `poll_event` 把 recv_buf 抽干。
+    ///
+    /// 返回这次 sink 被调用的次数（= 完成的 Binary 帧数）。
+    pub fn feed_binary_zero_copy<F>(
+        &mut self,
+        bytes: &[u8],
+        mut sink: F,
+    ) -> Result<usize, WsError>
+    where
+        F: FnMut(&[u8]),
+    {
+        if self.state != ConnState::Open {
+            // handshake 还没完 / 已 closing：fallback 进 recv_buf 走 slow path
+            self.recv_buf.extend_from_slice(bytes);
+            return Ok(0);
+        }
+
+        let mut sink_count = 0_usize;
+        let mut pos = 0_usize;
+
+        // ── Phase 1: 把上一次的 binary_remainder 用 bytes 接力补完 ──
+        if !self.binary_remainder.is_empty() {
+            loop {
+                match parse_header(&self.binary_remainder) {
+                    Ok(Some((hdr, header_size))) => {
+                        self.fast_path_check(&hdr)?;
+                        let total = header_size + hdr.payload_len as usize;
+                        if self.binary_remainder.len() >= total {
+                            // 整帧已在 remainder 里（少见：tiny payload + push 一两字节就够）
+                            sink(&self.binary_remainder[header_size..total]);
+                            sink_count += 1;
+                            self.binary_remainder.drain(..total);
+                            if self.binary_remainder.is_empty() {
+                                break;
+                            }
+                            // 继续看 remainder 里还有没有下一帧
+                        } else {
+                            // 需要从 bytes 取够字节补全这帧
+                            let need = total - self.binary_remainder.len();
+                            let take = need.min(bytes.len() - pos);
+                            self.binary_remainder.extend_from_slice(&bytes[pos..pos + take]);
+                            pos += take;
+                            if take < need {
+                                // bytes 取尽帧仍不全；下一轮再来
+                                return Ok(sink_count);
+                            }
+                            sink(&self.binary_remainder[header_size..]);
+                            sink_count += 1;
+                            self.binary_remainder.clear();
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        // remainder 字节不够解 header；接力 push 直到能解或 bytes 用完
+                        let needed = MAX_HEADER_LEN - self.binary_remainder.len();
+                        let take = needed.min(bytes.len() - pos);
+                        self.binary_remainder.extend_from_slice(&bytes[pos..pos + take]);
+                        pos += take;
+                        if take == 0 {
+                            return Ok(sink_count);
+                        }
+                        // 继续 loop 试 parse_header
+                    }
+                    Err(e) => {
+                        self.queue_close(
+                            CloseCode::ProtocolError.as_u16(),
+                            "frame parse error",
+                        );
+                        return Err(WsError::Frame(e));
+                    }
+                }
+            }
+        }
+
+        // ── Phase 2: bytes[pos..] 里解完整帧，零拷贝 sink ──
+        while pos < bytes.len() {
+            match parse_header(&bytes[pos..]) {
+                Ok(Some((hdr, header_size))) => {
+                    self.fast_path_check(&hdr)?;
+                    let total = header_size + hdr.payload_len as usize;
+                    if bytes.len() - pos < total {
+                        // 末尾不全帧 —— 留给下一次 feed
+                        self.binary_remainder.extend_from_slice(&bytes[pos..]);
+                        return Ok(sink_count);
+                    }
+                    sink(&bytes[pos + header_size..pos + total]);
+                    sink_count += 1;
+                    pos += total;
+                }
+                Ok(None) => {
+                    self.binary_remainder.extend_from_slice(&bytes[pos..]);
+                    return Ok(sink_count);
+                }
+                Err(e) => {
+                    self.queue_close(CloseCode::ProtocolError.as_u16(), "frame parse error");
+                    return Err(WsError::Frame(e));
+                }
+            }
+        }
+
+        Ok(sink_count)
+    }
+
+    /// `drain_binary_frames` / `feed_binary_zero_copy` 共用的守门：FIN +
+    /// Binary + unmasked + payload ≤ max。任何一条不过就 queue_close + Err。
+    fn fast_path_check(&mut self, hdr: &FrameHeader) -> Result<(), WsError> {
+        if !hdr.fin {
+            self.queue_close(CloseCode::ProtocolError.as_u16(), "fast-path: fragmented");
+            return Err(WsError::Protocol("fast-path: fragmented frame"));
+        }
+        if hdr.opcode != OpCode::Binary {
+            self.queue_close(CloseCode::ProtocolError.as_u16(), "fast-path: non-binary");
+            return Err(WsError::Protocol("fast-path: non-Binary opcode"));
+        }
+        if hdr.mask.is_some() {
+            self.queue_close(
+                CloseCode::ProtocolError.as_u16(),
+                "server sent masked frame",
+            );
+            return Err(WsError::Frame(FrameError::ServerSentMaskedFrame));
+        }
+        if hdr.payload_len > self.config.max_frame_payload {
+            self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
+            return Err(WsError::MessageTooLarge);
+        }
+        Ok(())
     }
 
     /// 主动发 Text。`payload` 必须是合法 UTF-8（debug 模式断言）。仅在

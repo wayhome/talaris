@@ -62,9 +62,7 @@ fn main() {
     let pin_cpu: Option<usize> = common::arg_opt("--user-cpu");
 
     #[cfg(target_os = "linux")]
-    if let Some(cpu) = pin_cpu {
-        common::pin_or_warn("ws_framing", cpu);
-    }
+    let _pin_guard = pin_cpu.map(|cpu| common::PinGuard::pin("ws_framing", cpu));
     let _ = pin_cpu; // suppress unused on non-linux
 
     eprintln!("[ws_framing] iters={iters}");

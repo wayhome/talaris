@@ -138,15 +138,22 @@ mod linux_impl {
         );
         eprintln!();
 
-        // ── variant 1/2: talaris ─────────────────────────────────────────
-        eprintln!("─── variant 1/2: talaris (Pool, multishot recv, SQ_POLL + pin) ───");
+        // ── variant 1/3: talaris pool.pump (general path) ────────────────
+        eprintln!("─── variant 1/3: talaris Pool.pump (general path, Event enum) ───");
         let talaris = with_fresh_stream_server(server_cpu, chunk_buf.clone(), |addr| {
             run_talaris(addr, stop, payload, talaris_cpu, sq_poll_cpu)
         });
         eprintln!();
 
-        // ── variant 2/2: tokio ──────────────────────────────────────────
-        eprintln!("─── variant 2/2: tokio (epoll + current_thread + pin) ───");
+        // ── variant 2/3: talaris pool.pump_binary (fast path) ────────────
+        eprintln!("─── variant 2/3: talaris Pool.pump_binary (fast path) ───");
+        let talaris_fast = with_fresh_stream_server(server_cpu, chunk_buf.clone(), |addr| {
+            run_talaris_fast(addr, stop, payload, talaris_cpu, sq_poll_cpu)
+        });
+        eprintln!();
+
+        // ── variant 3/3: tokio ───────────────────────────────────────────
+        eprintln!("─── variant 3/3: tokio (epoll + current_thread + pin) ───");
         let tokio = with_fresh_stream_server(server_cpu, chunk_buf.clone(), |addr| {
             run_tokio(addr, stop, payload, tokio_cpu)
         });
@@ -155,38 +162,44 @@ mod linux_impl {
         println!("=== ws_ingress_single (payload={payload}B) ===");
         println!();
         println!(
-            "{:<14} │ {:>14} │ {:>10} │ {:>14} │ {:>11}",
+            "{:<22} │ {:>14} │ {:>10} │ {:>14} │ {:>11}",
             "variant", "frames", "elapsed", "frames/s", "MiB/s"
         );
-        println!("{}", "─".repeat(72));
+        println!("{}", "─".repeat(82));
+        for (label, o) in [
+            ("talaris Pool.pump", &talaris),
+            ("talaris pump_binary", &talaris_fast),
+            ("tokio", &tokio),
+        ] {
+            println!(
+                "{:<22} │ {:>14} │ {:>9.3}s │ {:>14} │ {:>11.2}",
+                label,
+                fmt_int(o.frames),
+                o.elapsed.as_secs_f64(),
+                fmt_int(o.frames_per_sec() as u64),
+                o.mib_per_sec(payload),
+            );
+        }
+        let r_fast = talaris_fast.frames_per_sec() / talaris.frames_per_sec();
+        let r_vs_tokio = talaris_fast.frames_per_sec() / tokio.frames_per_sec();
+        println!();
         println!(
-            "{:<14} │ {:>14} │ {:>9.3}s │ {:>14} │ {:>11.2}",
-            "talaris",
-            fmt_int(talaris.frames),
-            talaris.elapsed.as_secs_f64(),
-            fmt_int(talaris.frames_per_sec() as u64),
-            talaris.mib_per_sec(payload),
+            "fast-path gain vs general path: {:.2}× ({:.0} → {:.0} f/s)",
+            r_fast,
+            talaris.frames_per_sec(),
+            talaris_fast.frames_per_sec()
         );
-        println!(
-            "{:<14} │ {:>14} │ {:>9.3}s │ {:>14} │ {:>11.2}",
-            "tokio",
-            fmt_int(tokio.frames),
-            tokio.elapsed.as_secs_f64(),
-            fmt_int(tokio.frames_per_sec() as u64),
-            tokio.mib_per_sec(payload),
-        );
-        let ratio = talaris.frames_per_sec() / tokio.frames_per_sec();
-        println!("ratio (talaris / tokio) = {ratio:.2}×");
+        println!("fast-path vs tokio: {r_vs_tokio:.2}× (1.0 = parity)");
 
         println!();
         println!("=== inter-arrival latency (delivery jitter) ===");
         common::print_comparison(&[
-            ("talaris", &talaris.inter_arrival),
+            ("talaris Pool.pump", &talaris.inter_arrival),
+            ("talaris pump_binary", &talaris_fast.inter_arrival),
             ("tokio", &tokio.inter_arrival),
         ]);
         println!();
-        println!("(inter-arrival = 用户回调拿到相邻两帧之间的 ns 间隔；")
-        ;
+        println!("(inter-arrival = 用户回调拿到相邻两帧之间的 ns 间隔；");
         println!(" loopback 上自然双峰：chunk 内 ~ns 级，chunk 间 ~µs 级)");
     }
 
@@ -257,6 +270,59 @@ mod linux_impl {
                 break;
             }
         }
+
+        let inter_arrival = common::inter_arrival_hist(&arrivals);
+        Outcome {
+            frames: frame_count,
+            elapsed,
+            inter_arrival,
+        }
+    }
+
+    /// Same client setup as `run_talaris`, but drain via `pump_binary` (fast path).
+    fn run_talaris_fast(
+        addr: SocketAddr,
+        stop: StopMode,
+        payload: usize,
+        user_cpu: usize,
+        sq_poll_cpu: u32,
+    ) -> Outcome {
+        let _guard = PinGuard::pin("talaris-fast", user_cpu);
+        eprintln!(
+            "[talaris-fast] user→CPU {user_cpu}, SQ_POLL kthread→CPU {sq_poll_cpu}"
+        );
+
+        let cfg = ConnectionConfig::new("localhost", addr.port(), "/")
+            .with_tls(false)
+            .with_sq_poll(10_000, Some(sq_poll_cpu));
+        let mut pool = Pool::new(PoolConfig::new(cfg.proactor)).expect("pool");
+        let h = pool.connect_blocking_to(cfg, addr).expect("connect");
+        assert_eq!(pool.state(h), Some(State::Open));
+
+        let mut arrivals: Vec<Instant> = Vec::with_capacity(stop.cap_hint());
+        let mut frame_count = 0_u64;
+        let bench_start = Instant::now();
+
+        while stop.keep_going(frame_count, bench_start) {
+            pool.pump_binary(|_h, data| {
+                debug_assert_eq!(data.len(), payload);
+                arrivals.push(Instant::now());
+                frame_count += 1;
+            })
+            .expect("pump_binary");
+        }
+        let elapsed = bench_start.elapsed();
+        eprintln!(
+            "[talaris-fast] {} frames in {:.3}s ({:.0} f/s)",
+            frame_count,
+            elapsed.as_secs_f64(),
+            frame_count as f64 / elapsed.as_secs_f64()
+        );
+
+        // 退出：直接 drop pool；server 下次 write_all 拿 EPIPE 退出。
+        // 不调 initiate_close —— 那个走 slow path 会和 fast-path Close-frame 严格
+        // 模式打架。
+        drop(pool);
 
         let inter_arrival = common::inter_arrival_hist(&arrivals);
         Outcome {

@@ -25,7 +25,7 @@
 use super::close::{
     CloseCode, CloseError, encode_close_payload, is_valid_endpoint_sent, parse_close_payload,
 };
-use super::frame::{FrameError, FrameHeader, MAX_HEADER_LEN, OpCode, encode_header};
+use super::frame::{FrameError, FrameHeader, MAX_HEADER_LEN, OpCode, encode_header, parse_header};
 use super::handshake::{
     HandshakeError, UpgradeRequest, encode_upgrade_request, generate_key, verify_upgrade_response,
 };
@@ -249,6 +249,81 @@ impl WsClient {
                 }
             }
         }
+    }
+
+    /// **Inbound fast path** —— 给"server 几乎只发 FIN-Binary 帧"的 workload
+    /// 用（典型订阅 client 行情流）。直接走 [`parse_header`] + 调 `sink(payload)`，
+    /// 跳过：fragmentation accumulator、`msg_buf` memcpy、control auto-pong、
+    /// `Event` enum dispatch、`Action`/`AdvanceResult` 状态机。
+    ///
+    /// **Strict mode**：任何非 FIN-Binary 帧（Text / Continuation / 任何 Control
+    /// 含 Ping / Pong / Close）都判 protocol error，queue 一个 Close 然后返
+    /// `Err`。如果业务上 server 真有可能发这些，**不要**用 fast path，走通用
+    /// [`Self::poll_event`]。
+    ///
+    /// 服务端发出的帧 RFC §5.1 规定 **不带 mask**；带了就 protocol error。
+    ///
+    /// 与 [`poll_event`](Self::poll_event) 不互斥 —— 同一 `WsClient` 上交替调用
+    /// 都安全（recv_buf 是 cursor，状态机不冲突）。生产典型用法：handshake 阶段
+    /// 用 `poll_event` 等 `HandshakeComplete`，进入 Open 后切到 `drain_binary_frames`。
+    ///
+    /// 返回这一轮从 `recv_buf` 消费掉的字节数（含 header + payload）。
+    pub fn drain_binary_frames<F>(&mut self, mut sink: F) -> Result<usize, WsError>
+    where
+        F: FnMut(&[u8]),
+    {
+        if self.state != ConnState::Open {
+            return Ok(0);
+        }
+
+        let mut total_consumed = 0_usize;
+        loop {
+            // 1) 解 header —— 短暂 immutable borrow，到 match 结束就 drop
+            let (hdr, header_size) = match parse_header(self.recv_buf.as_slice()) {
+                Ok(Some(x)) => x,
+                Ok(None) => break,
+                Err(e) => {
+                    self.queue_close(CloseCode::ProtocolError.as_u16(), "frame parse error");
+                    return Err(WsError::Frame(e));
+                }
+            };
+
+            // 2) Fast-path 守门：非 FIN-Binary-unmasked 立刻退出 + 关连接
+            if !hdr.fin {
+                self.queue_close(CloseCode::ProtocolError.as_u16(), "fast-path: fragmented");
+                return Err(WsError::Protocol("drain_binary_frames: fragmented frame"));
+            }
+            if hdr.opcode != OpCode::Binary {
+                self.queue_close(CloseCode::ProtocolError.as_u16(), "fast-path: non-binary");
+                return Err(WsError::Protocol("drain_binary_frames: non-Binary opcode"));
+            }
+            if hdr.mask.is_some() {
+                self.queue_close(
+                    CloseCode::ProtocolError.as_u16(),
+                    "server sent masked frame",
+                );
+                return Err(WsError::Frame(FrameError::ServerSentMaskedFrame));
+            }
+            if hdr.payload_len > self.config.max_frame_payload {
+                self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
+                return Err(WsError::MessageTooLarge);
+            }
+
+            let payload_len = hdr.payload_len as usize;
+            let frame_total = header_size + payload_len;
+            if self.recv_buf.as_slice().len() < frame_total {
+                break; // 这一帧字节没到齐，等下一轮
+            }
+
+            // 3) sink 拿到 payload slice，仍在 immutable borrow 期内 ——
+            //    return 之前不能 consume
+            sink(&self.recv_buf.as_slice()[header_size..frame_total]);
+
+            // 4) sink 返回后 borrow 释放，O(1) cursor 前进
+            self.recv_buf.consume(frame_total);
+            total_consumed += frame_total;
+        }
+        Ok(total_consumed)
     }
 
     /// 主动发 Text。`payload` 必须是合法 UTF-8（debug 模式断言）。仅在

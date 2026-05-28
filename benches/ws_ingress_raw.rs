@@ -302,9 +302,19 @@ mod linux_impl {
             .map_or(true, |&(_, _, more)| more);
 
         let bench_start = Instant::now();
-        let mut had_initial = !leftover.is_empty();
+        let mut loop_iter: u64 = 0;
+        let mut last_log = Instant::now();
 
         'outer: loop {
+            loop_iter += 1;
+            if last_log.elapsed() >= Duration::from_secs(1) {
+                eprintln!(
+                    "[raw] iter={loop_iter} frames={frame_count} leftover={}B armed={multishot_armed}",
+                    leftover.len()
+                );
+                last_log = Instant::now();
+            }
+
             // Parse all complete frames in leftover
             let mut pos = 0_usize;
             while pos < leftover.len() {
@@ -333,10 +343,6 @@ mod linux_impl {
             }
             leftover.drain(..pos);
 
-            if had_initial {
-                had_initial = false;
-            }
-
             if !stop.keep_going(frame_count, bench_start) {
                 break;
             }
@@ -358,12 +364,23 @@ mod linux_impl {
             // 把所有 ready CQE 一口气吃干净，能批多深就批多深
             let mut rearm_needed = false;
             let mut chunks: Vec<(u16, usize)> = Vec::with_capacity(32);
+            let mut weird_cqes: u32 = 0;
             proactor.drain_completions(|c| {
                 let res = match c.to_result() {
                     Ok(n) => n,
-                    Err(_) => return,
+                    Err(e) => {
+                        eprintln!("[raw] CQE Err: {e}, more={}", c.has_more());
+                        if !c.has_more() {
+                            rearm_needed = true;
+                        }
+                        return;
+                    }
                 };
                 if res == 0 {
+                    weird_cqes += 1;
+                    if !c.has_more() {
+                        rearm_needed = true;
+                    }
                     return;
                 }
                 if let Some(bid) = c.buffer_id() {
@@ -375,6 +392,9 @@ mod linux_impl {
                     rearm_needed = true;
                 }
             });
+            if weird_cqes > 0 {
+                eprintln!("[raw] {weird_cqes} CQE res=0 drained");
+            }
 
             // 复制每个 chunk 到 leftover，然后 recycle 对应 bid
             for &(bid, n) in &chunks {

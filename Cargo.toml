@@ -13,6 +13,9 @@ documentation = "https://docs.rs/talaris"
 readme        = "README.md"
 keywords      = ["websocket", "io-uring", "tls", "network", "hft"]
 categories    = ["network-programming", "asynchronous"]
+# 关掉 benches/ 的 auto-discover —— 共享 helper 住 benches/common/mod.rs 不是 target；
+# bench target 全部走下面的 [[bench]] 列表显式声明，方便配 `harness = false`。
+autobenches   = false
 
 [lib]
 name = "talaris"
@@ -68,6 +71,35 @@ opt-level     = 3
 lto           = "thin"
 codegen-units = 1
 debug         = true
+
+# ─── bench targets ──────────────────────────────────────────────────────
+# 全部 `harness = false`：自己写 fn main()，HdrHistogram + Instant 自己测时间，
+# 不走 libtest #[bench] / criterion harness（criterion 的 sampling 在 < 100 ns
+# 量级会被自身开销淹没；HFT 路径要更直接的工具）。
+#
+# 跑法：`taskset -c 0-7 cargo bench --bench <name> -- <args>`
+# 单独 release build：`cargo build --release --bench <name>`，产物在
+# `target/release/deps/<name>-<hash>`（带 hash，因为 dev-dep 不一样）。
+
+[[bench]]
+name    = "proactor_overhead"
+harness = false
+
+[[bench]]
+name    = "tcp_echo"
+harness = false
+
+[[bench]]
+name    = "ws_framing"
+harness = false
+
+[[bench]]
+name    = "pool_ws_echo"
+harness = false
+
+[[bench]]
+name    = "pool_fanout"
+harness = false
 
 # ─── lints ──────────────────────────────────────────────────────────────
 [lints.rust]

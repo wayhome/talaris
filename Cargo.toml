@@ -36,9 +36,13 @@ libc         = "0.2"
 io-uring      = "0.7"
 core_affinity = "0.8"
 
-# example 用：pool_two_pub_streams 的 per-handle latency 测量
+# example / bench 用：per-handle latency 测量 + tokio 对照组
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 hdrhistogram = "7"
+# benchmark 对照组。features 砍到只够单线程 TCP echo —— 不让 tokio 拉一堆
+# 额外组件（fs / signal / process / sync 等）进 bench 二进制；这样比较更接近
+# "tokio 的 IO 模型" 而非"tokio 的全家桶"。
+tokio        = { version = "1", default-features = false, features = ["rt", "net", "io-util", "macros"] }
 
 # ─── profiles ───────────────────────────────────────────────────────────
 [profile.dev]

@@ -93,6 +93,10 @@ harness = false
 name    = "ws_ingress_fanout"
 harness = false
 
+[[bench]]
+name    = "ws_ingress_raw"
+harness = false
+
 # ─── lints ──────────────────────────────────────────────────────────────
 [lints.rust]
 unsafe_op_in_unsafe_fn        = "warn"

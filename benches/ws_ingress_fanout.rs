@@ -310,6 +310,15 @@ mod linux_impl {
             .build()
             .expect("rt");
 
+        // 把 total frame target 等分到 N 个 conn。talaris 那侧 frame_count 是
+        // pump 回调里的"跨所有 conn 累加"，所以两侧都要拉齐到"总帧数 = stop"。
+        // 不这么做 tokio task 各自跑满 stop，总活儿是 talaris 的 N 倍，throughput
+        // 数字虽然算对了但 latency hist sample 多了 N 倍 → tail 不可比。
+        let per_conn_stop = match stop {
+            StopMode::Frames(n) => StopMode::Frames((n / u64::from(n_conns)).max(1)),
+            StopMode::Seconds(_) => stop,
+        };
+
         rt.block_on(async move {
             use tokio::net::TcpStream;
 
@@ -327,7 +336,7 @@ mod linux_impl {
                     let (arr, cnt) = common::tokio_recv_ws_binary_frames(
                         &mut s,
                         leftover,
-                        stop,
+                        per_conn_stop,
                         payload,
                         bench_start,
                     )

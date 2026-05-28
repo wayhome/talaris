@@ -17,12 +17,14 @@ use crate::proactor::{BufferRingError, ProactorConfig, ProactorError};
 use crate::tls::TlsError;
 use crate::ws::WsError;
 
-/// 单 buffer 字节数。WS 帧多数 <4 KiB，超大 message 由 `WsClient` 流式拼接。
-pub(crate) const BUF_RING_BUF_SIZE: u32 = 4 * 1024;
+/// 单 buffer 字节数默认值。caller 可通过 [`ConnectionConfig::with_buf_ring`]
+/// 覆盖。HFT 行情常见 200B-1KB 帧，4 KiB 一格足够装下不跨 boundary；订阅 book
+/// snapshot (4-16 KiB+) 时可调大到 16/32 KiB 减少 CQE 个数。
+pub const DEFAULT_BUF_RING_BUF_SIZE: u32 = 4 * 1024;
 
-/// buffer ring entry 数（必须 2^N）。256 × 4 KiB = 1 MiB 池子，避免 Deribit
-/// 行情突发时 multishot CQE 在 user-space recycle 前耗尽 provided buffers。
-pub(crate) const BUF_RING_ENTRIES: u16 = 256;
+/// buffer ring entry 数默认值（必须 2^N）。256 × 4 KiB = 1 MiB 池子，避免
+/// 行情突发时 multishot 在 user-space recycle 前耗尽 provided buffers。
+pub const DEFAULT_BUF_RING_ENTRIES: u16 = 256;
 
 /// Driver 状态机。
 ///
@@ -93,6 +95,15 @@ pub struct ConnectionConfig {
     pub conn_id: u32,
     /// 本 conn 独占的 buffer ring group id。同样由 Pool 分配。
     pub bgid: u16,
+    /// multishot recv 用的 provided buffer 单个大小（字节）。kernel 每次 RX
+    /// 最多写满这一格然后 post CQE。**取多大平衡 latency vs throughput**：
+    /// 小（4 KiB 默认）→ 单帧不跨 boundary 概率高 / 单 CQE 处理快；
+    /// 大（16-64 KiB）→ CQE 数下降 / 大 payload 不切碎，但 partial frame
+    /// remainder 处理变贵。详见 [`Self::with_buf_ring`]。
+    pub buf_ring_buf_size: u32,
+    /// buffer ring entry 数。必须非零 2 的幂。`entries × buf_size` = 整池字节数；
+    /// 太小会让 multishot 在 user space recycle 跟不上时频繁 ENOBUFS。
+    pub buf_ring_entries: u16,
 }
 
 impl ConnectionConfig {
@@ -106,6 +117,8 @@ impl ConnectionConfig {
             proactor: ProactorConfig::default(),
             conn_id: 0,
             bgid: 0,
+            buf_ring_buf_size: DEFAULT_BUF_RING_BUF_SIZE,
+            buf_ring_entries: DEFAULT_BUF_RING_ENTRIES,
         }
     }
 
@@ -120,6 +133,32 @@ impl ConnectionConfig {
     pub const fn with_sq_poll(mut self, idle_ms: u32, cpu: Option<u32>) -> Self {
         self.proactor.sq_poll_idle_ms = Some(idle_ms);
         self.proactor.sq_poll_cpu = cpu;
+        self
+    }
+
+    /// 覆盖 multishot recv 的 provided buffer ring 配置。
+    ///
+    /// - `buf_size`：单格字节数。建议覆盖到 ≥ 最常见 frame 大小的 2 倍，让大
+    ///   多数 frame 不跨 boundary。HFT trades/quotes 200B-1KB 用 4 KiB 已足够；
+    ///   订阅 L2 book delta (1-4 KiB) 用 8 KiB；订阅 full snapshot (4-32 KiB)
+    ///   用 32 KiB 起。
+    /// - `entries`：必须非零 2 的幂。整池字节 `entries × buf_size` 决定 burst
+    ///   buffering 能撑多深。默认 256 × 4 KiB = 1 MiB。
+    ///
+    /// 内核上限 `entries ≤ 32768`。`buf_size` 没有硬上限但 `entries × buf_size`
+    /// 受限于进程 lockable memory。
+    ///
+    /// # Panics
+    ///
+    /// debug build 下 `entries == 0 || !entries.is_power_of_two()` 立刻 panic；
+    /// release build 下 [`Pool::connect_blocking`](crate::Pool::connect_blocking)
+    /// 时 [`BufferRing::new`] 会返 Err。
+    #[must_use]
+    pub const fn with_buf_ring(mut self, buf_size: u32, entries: u16) -> Self {
+        debug_assert!(buf_size > 0, "buf_size must be > 0");
+        debug_assert!(entries > 0 && entries.is_power_of_two(), "entries must be non-zero power of 2");
+        self.buf_ring_buf_size = buf_size;
+        self.buf_ring_entries = entries;
         self
     }
 }

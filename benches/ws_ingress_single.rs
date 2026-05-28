@@ -111,6 +111,8 @@ mod linux_impl {
         let talaris_cpu: usize = common::arg_or("--talaris-cpu", 1);
         let sq_poll_cpu: u32 = common::arg_or("--sq-poll-cpu", 5);
         let tokio_cpu: usize = common::arg_or("--tokio-cpu", 2);
+        let buf_size: u32 = common::arg_or("--buf-size", 4096);
+        let buf_entries: u16 = common::arg_or("--buf-entries", 256);
 
         eprintln!("=========================================================");
         eprintln!(" ws_ingress_single — 1 conn server push → client drain");
@@ -120,6 +122,8 @@ mod linux_impl {
         eprintln!(" server-cpu: {server_cpu}  (fresh tokio runtime per variant)");
         eprintln!(" talaris   : user→CPU {talaris_cpu}, SQ_POLL→CPU {sq_poll_cpu}");
         eprintln!(" tokio     : worker→CPU {tokio_cpu}");
+        eprintln!(" buf_ring  : {buf_entries} × {buf_size}B = {} KiB pool",
+            (u32::from(buf_entries) * buf_size) / 1024);
         eprintln!(" execution : 串行，inline on main thread，每 variant 之间 unpin");
         eprintln!();
 
@@ -141,14 +145,14 @@ mod linux_impl {
         // ── variant 1/3: talaris pool.pump (general path) ────────────────
         eprintln!("─── variant 1/3: talaris Pool.pump (general path, Event enum) ───");
         let talaris = with_fresh_stream_server(server_cpu, chunk_buf.clone(), |addr| {
-            run_talaris(addr, stop, payload, talaris_cpu, sq_poll_cpu)
+            run_talaris(addr, stop, payload, talaris_cpu, sq_poll_cpu, buf_size, buf_entries)
         });
         eprintln!();
 
         // ── variant 2/3: talaris pool.pump_binary (fast path) ────────────
         eprintln!("─── variant 2/3: talaris Pool.pump_binary (fast path) ───");
         let talaris_fast = with_fresh_stream_server(server_cpu, chunk_buf.clone(), |addr| {
-            run_talaris_fast(addr, stop, payload, talaris_cpu, sq_poll_cpu)
+            run_talaris_fast(addr, stop, payload, talaris_cpu, sq_poll_cpu, buf_size, buf_entries)
         });
         eprintln!();
 
@@ -226,6 +230,8 @@ mod linux_impl {
         payload: usize,
         user_cpu: usize,
         sq_poll_cpu: u32,
+        buf_size: u32,
+        buf_entries: u16,
     ) -> Outcome {
         let _guard = PinGuard::pin("talaris", user_cpu);
         eprintln!(
@@ -234,7 +240,8 @@ mod linux_impl {
 
         let cfg = ConnectionConfig::new("localhost", addr.port(), "/")
             .with_tls(false)
-            .with_sq_poll(10_000, Some(sq_poll_cpu));
+            .with_sq_poll(10_000, Some(sq_poll_cpu))
+            .with_buf_ring(buf_size, buf_entries);
         let mut pool = Pool::new(PoolConfig::new(cfg.proactor)).expect("pool");
         let h = pool.connect_blocking_to(cfg, addr).expect("connect");
         assert_eq!(pool.state(h), Some(State::Open));
@@ -286,6 +293,8 @@ mod linux_impl {
         payload: usize,
         user_cpu: usize,
         sq_poll_cpu: u32,
+        buf_size: u32,
+        buf_entries: u16,
     ) -> Outcome {
         let _guard = PinGuard::pin("talaris-fast", user_cpu);
         eprintln!(
@@ -294,7 +303,8 @@ mod linux_impl {
 
         let cfg = ConnectionConfig::new("localhost", addr.port(), "/")
             .with_tls(false)
-            .with_sq_poll(10_000, Some(sq_poll_cpu));
+            .with_sq_poll(10_000, Some(sq_poll_cpu))
+            .with_buf_ring(buf_size, buf_entries);
         let mut pool = Pool::new(PoolConfig::new(cfg.proactor)).expect("pool");
         let h = pool.connect_blocking_to(cfg, addr).expect("connect");
         assert_eq!(pool.state(h), Some(State::Open));

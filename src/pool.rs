@@ -326,14 +326,9 @@ impl Pool {
         self.pump_binary_impl(0, sink)
     }
 
-    /// fast-path pump 实现。和 [`pump_impl`](Self::pump_impl) 的区别有两点：
-    ///
-    /// 1. **Recv CQE 走 zero-copy**：`handle_completion_binary` 替代
-    ///    `handle_completion`，plain TCP + Open 状态下直接把 kernel buf_ring
-    ///    entry slice 喂 `WsClient::feed_binary_zero_copy`，sink 在 per-CQE
-    ///    dispatch 里同步触发，跳过 `recv_buf` 中转 memcpy。
-    /// 2. **末尾 drain 兜底**：TLS 路径 / handshake 阶段 / Closing 阶段仍走
-    ///    `feed_recv`，这些帧需要在最后 `drain_binary_frames(sink)` 抽走。
+    /// fast-path pump 实现。结构和 [`pump_impl`](Self::pump_impl) 一致，唯一区
+    /// 别是最后那一轮 per-conn drain 调 [`WsClient::drain_binary_frames`] 而非
+    /// `poll_event`，跳过 Event enum + 状态机。
     fn pump_binary_impl<F>(&mut self, wait_nr: usize, mut sink: F) -> Result<(), ConnectionError>
     where
         F: FnMut(ConnHandle, &[u8]),
@@ -366,20 +361,13 @@ impl Pool {
         for &c in completions_buf.iter() {
             let conn_id =
                 u32::try_from(c.user_data.token() & CONN_ID_MASK).expect("28-bit mask fits u32");
-            if let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut) {
-                let handle = ConnHandle(conn.conn_id());
-                let result = conn.handle_completion_binary(proactor, c, |payload| {
-                    sink(handle, payload);
-                });
-                if let Err(e) = result {
-                    fail_conn(conn, e, &mut first_err);
-                }
+            if let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut)
+                && let Err(e) = conn.handle_completion(proactor, c)
+            {
+                fail_conn(conn, e, &mut first_err);
             }
         }
 
-        // 末尾兜底：TLS / handshake / Closing 路径走过 feed_recv，这里把堆在
-        // recv_buf 里的帧抽出来。plain TCP fast-path 时 recv_buf 始终空，这步
-        // 是 O(1) 短路（parse_header 看到 0 字节立刻 break）。
         for slot in conns.iter_mut() {
             let Some(conn) = slot.as_mut() else { continue };
             let handle = ConnHandle(conn.conn_id());

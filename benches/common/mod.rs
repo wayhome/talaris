@@ -1124,7 +1124,7 @@ fn set_socket_option(
 }
 
 #[cfg(target_os = "linux")]
-fn as_bytes<T>(value: &T) -> &[u8] {
+const fn as_bytes<T>(value: &T) -> &[u8] {
     // SAFETY: Linux tls_crypto_info structs are plain C structs with initialized fields.
     unsafe {
         std::slice::from_raw_parts(

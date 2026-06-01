@@ -643,15 +643,129 @@ pub async fn tokio_recv_ws_binary_frames(
     (arrivals, frame_count)
 }
 
+#[cfg(target_os = "linux")]
+pub async fn tokio_recv_ws_binary_frames_sampled(
+    s: &mut tokio::net::TcpStream,
+    initial_leftover: Vec<u8>,
+    stop: StopMode,
+    expected_payload: usize,
+    sample_every: u64,
+    bench_start: Instant,
+) -> (Vec<Instant>, u64) {
+    use talaris::ws::frame::parse_header;
+    use tokio::io::AsyncReadExt as _;
+
+    let mut arrivals = sampled_arrivals(stop, sample_every);
+    let mut frame_count = 0_u64;
+    let mut recv_buf = vec![0_u8; 256 * 1024];
+    let mut leftover = initial_leftover;
+    leftover.reserve(64 * 1024);
+
+    'outer: loop {
+        let mut pos = 0_usize;
+        while pos < leftover.len() {
+            match parse_header(&leftover[pos..]) {
+                Ok(Some((hdr, consumed))) => {
+                    let total = consumed + hdr.payload_len as usize;
+                    if leftover.len() - pos < total {
+                        break;
+                    }
+                    debug_assert_eq!(hdr.payload_len as usize, expected_payload);
+                    frame_count += 1;
+                    record_sampled_arrival(&mut arrivals, frame_count, sample_every);
+                    pos += total;
+                    if !stop.keep_going(frame_count, bench_start) {
+                        leftover.drain(..pos);
+                        break 'outer;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    eprintln!("[tokio_ws_sampled] parse_header err after {frame_count}: {e}");
+                    leftover.drain(..pos);
+                    break 'outer;
+                }
+            }
+        }
+        leftover.drain(..pos);
+
+        if !stop.keep_going(frame_count, bench_start) {
+            break;
+        }
+        let n = match s.read(&mut recv_buf).await {
+            Ok(0) => {
+                eprintln!("[tokio_ws_sampled] EOF after {frame_count} frames");
+                break;
+            }
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("[tokio_ws_sampled] read error after {frame_count}: {e}");
+                break;
+            }
+        };
+        leftover.extend_from_slice(&recv_buf[..n]);
+    }
+
+    (arrivals, frame_count)
+}
+
 // ─── Tokio 侧 client：同一 rustls 的 TLS + WS recv loop ───────────────
 
 #[cfg(target_os = "linux")]
 pub fn local_tls_client_connection() -> rustls::ClientConnection {
+    local_tls_client_connection_with_config(local_tls_client_config())
+}
+
+#[cfg(target_os = "linux")]
+pub fn local_ktls_client_connection() -> rustls::ClientConnection {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(local_tls_cert()).expect("add localhost cert");
+    let mut config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    config.enable_secret_extraction = true;
+    local_tls_client_connection_with_config(std::sync::Arc::new(config))
+}
+
+#[cfg(target_os = "linux")]
+fn local_tls_client_connection_with_config(
+    config: std::sync::Arc<rustls::ClientConfig>,
+) -> rustls::ClientConnection {
     let server_name = rustls::pki_types::ServerName::try_from("localhost")
         .expect("localhost is valid server name")
         .to_owned();
-    rustls::ClientConnection::new(local_tls_client_config(), server_name)
-        .expect("localhost tls client")
+    rustls::ClientConnection::new(config, server_name).expect("localhost tls client")
+}
+
+#[cfg(target_os = "linux")]
+pub async fn tokio_ktls_ws_upgrade_client(
+    s: &mut tokio::net::TcpStream,
+    mut tls: rustls::ClientConnection,
+    host: &str,
+    path: &str,
+) -> std::io::Result<Vec<u8>> {
+    let mut network_buf = vec![0_u8; 256 * 1024];
+    let mut plaintext = Vec::<u8>::new();
+    while tls.is_handshaking() {
+        flush_tokio_tls(s, &mut tls).await?;
+        read_tokio_tls(s, &mut tls, &mut network_buf, &mut plaintext).await?;
+    }
+    flush_tokio_tls(s, &mut tls).await?;
+    if !plaintext.is_empty() {
+        return Err(std::io::Error::other(
+            "received application plaintext before kTLS install",
+        ));
+    }
+
+    let version = tls
+        .protocol_version()
+        .ok_or_else(|| std::io::Error::other("TLS handshake completed without protocol version"))?;
+    let secrets = tls
+        .dangerous_extract_secrets()
+        .map_err(std::io::Error::other)?;
+    install_ktls(s, version, secrets)?;
+    tokio_ws_upgrade_client(s, host, path).await
 }
 
 #[cfg(target_os = "linux")]
@@ -910,5 +1024,112 @@ fn drain_tls_plaintext(
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
             Err(e) => return Err(e),
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn install_ktls(
+    s: &tokio::net::TcpStream,
+    version: rustls::ProtocolVersion,
+    secrets: rustls::ExtractedSecrets,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    let fd = s.as_raw_fd();
+    set_socket_option(fd, libc::SOL_TCP, libc::TCP_ULP, b"tls")?;
+    set_ktls_direction(fd, libc::TLS_TX, version, secrets.tx)?;
+    set_ktls_direction(fd, libc::TLS_RX, version, secrets.rx)
+}
+
+#[cfg(target_os = "linux")]
+fn set_ktls_direction(
+    fd: std::os::fd::RawFd,
+    direction: libc::c_int,
+    version: rustls::ProtocolVersion,
+    (seq, secrets): (u64, rustls::ConnectionTrafficSecrets),
+) -> std::io::Result<()> {
+    let version = match version {
+        rustls::ProtocolVersion::TLSv1_2 => libc::TLS_1_2_VERSION,
+        rustls::ProtocolVersion::TLSv1_3 => libc::TLS_1_3_VERSION,
+        _ => {
+            return Err(std::io::Error::other(
+                "kTLS probe only supports TLS 1.2 and TLS 1.3",
+            ));
+        }
+    };
+    let rec_seq = seq.to_be_bytes();
+    match secrets {
+        rustls::ConnectionTrafficSecrets::Aes128Gcm { key, iv } => {
+            let iv = iv.as_ref();
+            let crypto = libc::tls12_crypto_info_aes_gcm_128 {
+                info: libc::tls_crypto_info {
+                    version,
+                    cipher_type: libc::TLS_CIPHER_AES_GCM_128,
+                },
+                iv: iv[4..].try_into().expect("AES-GCM explicit IV is 8 bytes"),
+                key: key.as_ref().try_into().expect("AES-128 key is 16 bytes"),
+                salt: iv[..4].try_into().expect("AES-GCM salt is 4 bytes"),
+                rec_seq,
+            };
+            set_socket_option(fd, libc::SOL_TLS, direction, as_bytes(&crypto))
+        }
+        rustls::ConnectionTrafficSecrets::Aes256Gcm { key, iv } => {
+            let iv = iv.as_ref();
+            let crypto = libc::tls12_crypto_info_aes_gcm_256 {
+                info: libc::tls_crypto_info {
+                    version,
+                    cipher_type: libc::TLS_CIPHER_AES_GCM_256,
+                },
+                iv: iv[4..].try_into().expect("AES-GCM explicit IV is 8 bytes"),
+                key: key.as_ref().try_into().expect("AES-256 key is 32 bytes"),
+                salt: iv[..4].try_into().expect("AES-GCM salt is 4 bytes"),
+                rec_seq,
+            };
+            set_socket_option(fd, libc::SOL_TLS, direction, as_bytes(&crypto))
+        }
+        rustls::ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv } => {
+            let crypto = libc::tls12_crypto_info_chacha20_poly1305 {
+                info: libc::tls_crypto_info {
+                    version,
+                    cipher_type: libc::TLS_CIPHER_CHACHA20_POLY1305,
+                },
+                iv: iv.as_ref().try_into().expect("ChaCha20 IV is 12 bytes"),
+                key: key.as_ref().try_into().expect("ChaCha20 key is 32 bytes"),
+                salt: [],
+                rec_seq,
+            };
+            set_socket_option(fd, libc::SOL_TLS, direction, as_bytes(&crypto))
+        }
+        _ => Err(std::io::Error::other(
+            "kTLS probe does not support negotiated cipher suite",
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn set_socket_option(
+    fd: std::os::fd::RawFd,
+    level: libc::c_int,
+    name: libc::c_int,
+    value: &[u8],
+) -> std::io::Result<()> {
+    let len = libc::socklen_t::try_from(value.len()).expect("socket option length fits socklen_t");
+    // SAFETY: `value` points to `len` initialized bytes for the duration of setsockopt.
+    let rc = unsafe { libc::setsockopt(fd, level, name, value.as_ptr().cast(), len) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn as_bytes<T>(value: &T) -> &[u8] {
+    // SAFETY: Linux tls_crypto_info structs are plain C structs with initialized fields.
+    unsafe {
+        std::slice::from_raw_parts(
+            std::ptr::from_ref(value).cast::<u8>(),
+            std::mem::size_of::<T>(),
+        )
     }
 }

@@ -105,7 +105,7 @@ mod linux_impl {
         );
         eprintln!();
 
-        eprintln!("--- variant 1/4: talaris Pool.pump_data ---");
+        eprintln!("--- variant 1/5: talaris Pool.pump_data ---");
         let talaris = with_fresh_tls_server(server_cpu, chunk_buf.clone(), |addr| {
             run_talaris(
                 addr,
@@ -122,7 +122,7 @@ mod linux_impl {
         });
         eprintln!();
 
-        eprintln!("--- variant 2/4: talaris Pool.pump_data_spin ---");
+        eprintln!("--- variant 2/5: talaris Pool.pump_data_spin ---");
         let talaris_spin = with_fresh_tls_server(server_cpu, chunk_buf.clone(), |addr| {
             run_talaris(
                 addr,
@@ -139,15 +139,21 @@ mod linux_impl {
         });
         eprintln!();
 
-        eprintln!("--- variant 3/4: tokio + rustls + WsClient ---");
+        eprintln!("--- variant 3/5: tokio + rustls + WsClient ---");
         let tokio_ws = with_fresh_tls_server(server_cpu, chunk_buf.clone(), |addr| {
             run_tokio_ws_client(addr, stop, payload, tokio_cpu, sample_every)
         });
         eprintln!();
 
-        eprintln!("--- variant 4/4: tokio + rustls + bare parse_header lower bound ---");
-        let tokio_bare = with_fresh_tls_server(server_cpu, chunk_buf, |addr| {
+        eprintln!("--- variant 4/5: tokio + rustls + bare parse_header lower bound ---");
+        let tokio_bare = with_fresh_tls_server(server_cpu, chunk_buf.clone(), |addr| {
             run_tokio_bare(addr, stop, payload, tokio_cpu, sample_every)
+        });
+        eprintln!();
+
+        eprintln!("--- variant 5/5: tokio + kTLS + bare parse_header ceiling probe ---");
+        let tokio_ktls = with_fresh_tls_server(server_cpu, chunk_buf, |addr| {
+            run_tokio_ktls_bare(addr, stop, payload, tokio_cpu, sample_every)
         });
 
         println!();
@@ -163,6 +169,7 @@ mod linux_impl {
             ("talaris data spin", &talaris_spin),
             ("tokio + rustls + WS", &tokio_ws),
             ("tokio bare lower bound", &tokio_bare),
+            ("tokio kTLS ceiling", &tokio_ktls),
         ] {
             println!(
                 "{:<22} | {:>14} | {:>9.3}s | {:>14} | {:>11.2}",
@@ -182,6 +189,10 @@ mod linux_impl {
             "data spin vs tokio same WS: {:.2}x (1.0 = parity)",
             talaris_spin.frames_per_sec() / tokio_ws.frames_per_sec()
         );
+        println!(
+            "kTLS ceiling vs tokio bare: {:.2}x (probe only)",
+            tokio_ktls.frames_per_sec() / tokio_bare.frames_per_sec()
+        );
 
         println!();
         println!("=== inter-arrival latency (delivery jitter) ===");
@@ -190,6 +201,7 @@ mod linux_impl {
             ("talaris data spin", &talaris_spin.inter_arrival),
             ("tokio + rustls + WS", &tokio_ws.inter_arrival),
             ("tokio bare lower bound", &tokio_bare.inter_arrival),
+            ("tokio kTLS ceiling", &tokio_ktls.inter_arrival),
         ]);
         if sample_every != 1 {
             println!(
@@ -378,6 +390,56 @@ mod linux_impl {
             let elapsed = bench_start.elapsed();
             eprintln!(
                 "[tokio-tls-bare] {} frames in {:.3}s ({:.0} f/s)",
+                frame_count,
+                elapsed.as_secs_f64(),
+                frame_count as f64 / elapsed.as_secs_f64()
+            );
+
+            let _ = stream.shutdown().await;
+            Outcome {
+                frames: frame_count,
+                elapsed,
+                inter_arrival: common::inter_arrival_hist(&arrivals),
+            }
+        })
+    }
+
+    fn run_tokio_ktls_bare(
+        addr: SocketAddr,
+        stop: StopMode,
+        payload: usize,
+        user_cpu: usize,
+        sample_every: u64,
+    ) -> Outcome {
+        let _guard = PinGuard::pin("tokio-ktls-bare", user_cpu);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("rt");
+
+        rt.block_on(async move {
+            use tokio::io::AsyncWriteExt as _;
+
+            let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            stream.set_nodelay(true).expect("nodelay");
+            let tls = common::local_ktls_client_connection();
+            let leftover = common::tokio_ktls_ws_upgrade_client(&mut stream, tls, "localhost", "/")
+                .await
+                .expect("TLS handshake + kTLS install + WS upgrade");
+
+            let bench_start = Instant::now();
+            let (arrivals, frame_count) = common::tokio_recv_ws_binary_frames_sampled(
+                &mut stream,
+                leftover,
+                stop,
+                payload,
+                sample_every,
+                bench_start,
+            )
+            .await;
+            let elapsed = bench_start.elapsed();
+            eprintln!(
+                "[tokio-ktls-bare] {} frames in {:.3}s ({:.0} f/s)",
                 frame_count,
                 elapsed.as_secs_f64(),
                 frame_count as f64 / elapsed.as_secs_f64()

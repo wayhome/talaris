@@ -176,7 +176,7 @@ mod linux_impl {
 
         // ── variant 3/3: tokio ───────────────────────────────────────────
         eprintln!("─── variant 3/3: tokio (epoll + current_thread + pin) ───");
-        let tokio = with_fresh_stream_server(server_cpu, chunk_buf.clone(), |addr| {
+        let tokio = with_fresh_stream_server(server_cpu, chunk_buf, |addr| {
             run_tokio(addr, stop, payload, tokio_cpu)
         });
 
@@ -371,6 +371,7 @@ mod linux_impl {
             .expect("rt");
 
         rt.block_on(async move {
+            use tokio::io::AsyncWriteExt;
             use tokio::net::TcpStream;
             let mut s = TcpStream::connect(addr).await.expect("connect");
             s.set_nodelay(true).expect("nodelay");
@@ -390,7 +391,6 @@ mod linux_impl {
                 frame_count as f64 / elapsed.as_secs_f64()
             );
 
-            use tokio::io::AsyncWriteExt;
             let _ = s.shutdown().await;
 
             let inter_arrival = common::inter_arrival_hist(&arrivals);
@@ -407,7 +407,7 @@ mod linux_impl {
         let bytes = s.as_bytes();
         let mut out = String::with_capacity(s.len() + s.len() / 3);
         for (i, &b) in bytes.iter().enumerate() {
-            if i > 0 && (bytes.len() - i) % 3 == 0 {
+            if i > 0 && (bytes.len() - i).is_multiple_of(3) {
                 out.push(',');
             }
             out.push(b as char);

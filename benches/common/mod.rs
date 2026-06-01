@@ -193,7 +193,7 @@ impl PinGuard {
     pub fn pin(label: &str, cpu: usize) -> Self {
         let mut saved: libc::cpu_set_t = unsafe { std::mem::zeroed() };
         let rc = unsafe {
-            libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut saved)
+            libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &raw mut saved)
         };
         if rc != 0 {
             eprintln!(
@@ -212,7 +212,11 @@ impl PinGuard {
 impl Drop for PinGuard {
     fn drop(&mut self) {
         let rc = unsafe {
-            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &self.saved)
+            libc::sched_setaffinity(
+                0,
+                std::mem::size_of::<libc::cpu_set_t>(),
+                &raw const self.saved,
+            )
         };
         if rc != 0 {
             eprintln!(
@@ -336,9 +340,8 @@ async fn stream_session(mut s: tokio::net::TcpStream, chunk_buf: std::sync::Arc<
             break;
         }
     }
-    let req_str = match std::str::from_utf8(&req) {
-        Ok(s) => s,
-        Err(_) => return,
+    let Ok(req_str) = std::str::from_utf8(&req) else {
+        return;
     };
     let key = match req_str
         .lines()

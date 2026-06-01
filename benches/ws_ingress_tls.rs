@@ -218,19 +218,27 @@ mod linux_impl {
         let mut arrivals: Vec<Instant> = Vec::with_capacity(stop.cap_hint());
         let mut frame_count = 0_u64;
         let bench_start = Instant::now();
-        while stop.keep_going(frame_count, bench_start) {
-            let mut sink = |_h, ev| {
-                if let WsDataEvent::Binary(data) = ev {
-                    debug_assert_eq!(data.len(), payload);
-                    arrivals.push(Instant::now());
-                    frame_count += 1;
-                }
-            };
-            if let Some(spin_iters) = spin_iters {
-                pool.pump_data_spin(spin_iters, &mut sink)
-                    .expect("pump_data_spin");
-            } else {
-                pool.pump_data(&mut sink).expect("pump_data");
+        if let Some(spin_iters) = spin_iters {
+            while stop.keep_going(frame_count, bench_start) {
+                pool.pump_data_spin(spin_iters, |_h, ev| {
+                    if let WsDataEvent::Binary(data) = ev {
+                        debug_assert_eq!(data.len(), payload);
+                        arrivals.push(Instant::now());
+                        frame_count += 1;
+                    }
+                })
+                .expect("pump_data_spin");
+            }
+        } else {
+            while stop.keep_going(frame_count, bench_start) {
+                pool.pump_data(|_h, ev| {
+                    if let WsDataEvent::Binary(data) = ev {
+                        debug_assert_eq!(data.len(), payload);
+                        arrivals.push(Instant::now());
+                        frame_count += 1;
+                    }
+                })
+                .expect("pump_data");
             }
         }
         let elapsed = bench_start.elapsed();

@@ -83,7 +83,7 @@ mod linux_impl {
             }
         }
 
-        fn record(&mut self, ev: WsDataEvent<'_>) {
+        fn record(&mut self, ev: &WsDataEvent<'_>) {
             let now = Instant::now();
             if let Some(previous) = self.last_arrival.replace(now) {
                 common::record_ns(&mut self.inter_arrival, now - previous);
@@ -106,7 +106,7 @@ mod linux_impl {
             self.payload_size.record(payload.len().max(1) as u64).ok();
         }
 
-        fn frames(&self) -> u64 {
+        const fn frames(&self) -> u64 {
             self.text_frames + self.binary_frames
         }
     }
@@ -207,7 +207,7 @@ mod linux_impl {
         let mut stats = Stats::new();
         let started = Instant::now();
         while started.elapsed() < duration {
-            pool.pump_data_spin(spin_iters, |_handle, ev| stats.record(ev))
+            pool.pump_data_spin(spin_iters, |_handle, ev| stats.record(&ev))
                 .expect("pump Binance data");
         }
         stats

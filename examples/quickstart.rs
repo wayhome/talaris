@@ -5,7 +5,8 @@
     clippy::missing_panics_doc,
     clippy::doc_markdown,
     clippy::indexing_slicing,
-    clippy::cast_possible_truncation
+    clippy::cast_possible_truncation,
+    clippy::panic
 )]
 //! Quickstart —— talaris Pool 从 0 到 1 走通的最小例子。
 //!
@@ -50,9 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── 0. 解析两个 CPU 编号 ─────────────────────────────────────────
     // 极简 CLI：`--user-cpu N --sq-poll-cpu M`。失败时回退到 (1, 5)。
     let (user_cpu, sq_poll_cpu) = parse_cpu_args();
-    eprintln!(
-        "[quickstart] user thread → CPU {user_cpu}, SQ_POLL kthread → CPU {sq_poll_cpu}"
-    );
+    eprintln!("[quickstart] user thread → CPU {user_cpu}, SQ_POLL kthread → CPU {sq_poll_cpu}");
     eprintln!(
         "[quickstart] 提示：进程父 affinity 必须覆盖目标 CPU，建议外面套 \
          `taskset -c 0-N`"
@@ -64,7 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (_shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
     let server = thread::Builder::new()
         .name("quickstart-echo".into())
-        .spawn(move || ws_echo_server(listener, &shutdown_rx))?;
+        .spawn(move || ws_echo_server(&listener, &shutdown_rx))?;
     eprintln!("[quickstart] in-process WS echo server up on {addr}");
 
     // ── 2. 把 user 线程钉死在 user_cpu ───────────────────────────────
@@ -153,7 +152,7 @@ fn parse_cpu_args() -> (usize, usize) {
 // 个离线 round-trip 对端。
 // ───────────────────────────────────────────────────────────────────────
 #[cfg(target_os = "linux")]
-fn ws_echo_server(listener: std::net::TcpListener, _shutdown: &std::sync::mpsc::Receiver<()>) {
+fn ws_echo_server(listener: &std::net::TcpListener, _shutdown: &std::sync::mpsc::Receiver<()>) {
     use std::io::{Read, Write};
     use talaris::ws::OpCode;
     use talaris::ws::frame::{MAX_HEADER_LEN, encode_header};
@@ -233,16 +232,19 @@ fn read_one_frame(stream: &mut std::net::TcpStream) -> (talaris::ws::OpCode, Vec
     };
     let masked = (hdr[1] & 0x80) != 0;
     let len_field = hdr[1] & 0x7F;
-    let len: usize = if len_field < 126 {
-        usize::from(len_field)
-    } else if len_field == 126 {
-        let mut b = [0_u8; 2];
-        stream.read_exact(&mut b).expect("len16");
-        usize::from(u16::from_be_bytes(b))
-    } else {
-        let mut b = [0_u8; 8];
-        stream.read_exact(&mut b).expect("len64");
-        usize::try_from(u64::from_be_bytes(b)).expect("u64→usize")
+    let len: usize = match len_field {
+        0..=125 => usize::from(len_field),
+        126 => {
+            let mut b = [0_u8; 2];
+            stream.read_exact(&mut b).expect("len16");
+            usize::from(u16::from_be_bytes(b))
+        }
+        127 => {
+            let mut b = [0_u8; 8];
+            stream.read_exact(&mut b).expect("len64");
+            usize::try_from(u64::from_be_bytes(b)).expect("u64→usize")
+        }
+        _ => unreachable!("len_field is masked to 7 bits"),
     };
     let mut mask = [0_u8; 4];
     if masked {

@@ -644,7 +644,7 @@ pub async fn tokio_recv_ws_binary_frames(
 }
 
 #[cfg(target_os = "linux")]
-pub async fn tokio_recv_ws_binary_frames_sampled(
+pub async fn tokio_recv_ktls_ws_binary_frames_sampled(
     s: &mut tokio::net::TcpStream,
     initial_leftover: Vec<u8>,
     stop: StopMode,
@@ -653,8 +653,6 @@ pub async fn tokio_recv_ws_binary_frames_sampled(
     bench_start: Instant,
 ) -> (Vec<Instant>, u64) {
     use talaris::ws::frame::parse_header;
-    use tokio::io::AsyncReadExt as _;
-
     let mut arrivals = sampled_arrivals(stop, sample_every);
     let mut frame_count = 0_u64;
     let mut recv_buf = vec![0_u8; 256 * 1024];
@@ -692,7 +690,7 @@ pub async fn tokio_recv_ws_binary_frames_sampled(
         if !stop.keep_going(frame_count, bench_start) {
             break;
         }
-        let n = match s.read(&mut recv_buf).await {
+        let n = match tokio_ktls_read_application_data(s, &mut recv_buf).await {
             Ok(0) => {
                 eprintln!("[tokio_ws_sampled] EOF after {frame_count} frames");
                 break;
@@ -765,7 +763,7 @@ pub async fn tokio_ktls_ws_upgrade_client(
         .dangerous_extract_secrets()
         .map_err(std::io::Error::other)?;
     install_ktls(s, version, secrets)?;
-    tokio_ws_upgrade_client(s, host, path).await
+    tokio_ktls_ws_upgrade_after_install(s, host, path).await
 }
 
 #[cfg(target_os = "linux")]
@@ -1025,6 +1023,103 @@ fn drain_tls_plaintext(
             Err(e) => return Err(e),
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+async fn tokio_ktls_ws_upgrade_after_install(
+    s: &mut tokio::net::TcpStream,
+    host: &str,
+    path: &str,
+) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let key = talaris::ws::handshake::generate_key()
+        .map_err(|e| std::io::Error::other(format!("generate_key: {e}")))?;
+    let req = format!(
+        "GET {path} HTTP/1.1\r\n\
+         Host: {host}\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Key: {key}\r\n\
+         Sec-WebSocket-Version: 13\r\n\r\n"
+    );
+    s.write_all(req.as_bytes()).await?;
+
+    let mut resp = Vec::<u8>::new();
+    let mut buf = [0_u8; 4096];
+    loop {
+        let n = tokio_ktls_read_application_data(s, &mut buf).await?;
+        if n == 0 {
+            return Err(std::io::Error::other("conn closed mid-handshake"));
+        }
+        resp.extend_from_slice(&buf[..n]);
+        if let Some(idx) = resp.windows(4).position(|w| w == b"\r\n\r\n") {
+            let header_end = idx + 4;
+            return Ok(resp[header_end..].to_vec());
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn tokio_ktls_read_application_data(
+    s: &tokio::net::TcpStream,
+    buf: &mut [u8],
+) -> std::io::Result<usize> {
+    use tokio::io::Interest;
+
+    loop {
+        s.readable().await?;
+        match s.try_io(Interest::READABLE, || recv_ktls_record(s, buf)) {
+            Ok(Ok((n, None | Some(23)))) => return Ok(n),
+            Ok(Ok((_n, Some(_control_record)))) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_would_block) => {}
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn recv_ktls_record(
+    s: &tokio::net::TcpStream,
+    buf: &mut [u8],
+) -> std::io::Result<(usize, Option<u8>)> {
+    use std::os::fd::AsRawFd as _;
+
+    const CONTROL_SPACE: usize = libc::CMSG_SPACE(1) as usize;
+
+    let mut control = [0_u8; CONTROL_SPACE];
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    // SAFETY: zero is a valid empty msghdr initialization.
+    let mut msg = unsafe { std::mem::zeroed::<libc::msghdr>() };
+    msg.msg_iov = &raw mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = control.len();
+
+    // SAFETY: msg points to initialized iovec and control buffers for this synchronous call.
+    let n = unsafe { libc::recvmsg(s.as_raw_fd(), &raw mut msg, libc::MSG_DONTWAIT) };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // SAFETY: libc validates msg_controllen and returns null if no complete cmsghdr exists.
+    let cmsg = unsafe { libc::CMSG_FIRSTHDR(&raw const msg) };
+    let record_type = if cmsg.is_null() {
+        None
+    } else {
+        // SAFETY: CMSG_FIRSTHDR returned a header inside `control`; kTLS record type is one byte.
+        unsafe {
+            ((*cmsg).cmsg_level == libc::SOL_TLS && (*cmsg).cmsg_type == libc::TLS_GET_RECORD_TYPE)
+                .then(|| *libc::CMSG_DATA(cmsg))
+        }
+    };
+    Ok((
+        usize::try_from(n).expect("positive recvmsg length fits usize"),
+        record_type,
+    ))
 }
 
 #[cfg(target_os = "linux")]

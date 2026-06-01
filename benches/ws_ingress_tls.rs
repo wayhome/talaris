@@ -428,7 +428,7 @@ mod linux_impl {
                 .expect("TLS handshake + kTLS install + WS upgrade");
 
             let bench_start = Instant::now();
-            let (arrivals, frame_count) = common::tokio_recv_ws_binary_frames_sampled(
+            let (arrivals, frame_count) = common::tokio_recv_ktls_ws_binary_frames_sampled(
                 &mut stream,
                 leftover,
                 stop,

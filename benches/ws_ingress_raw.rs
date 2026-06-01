@@ -74,6 +74,8 @@ mod linux_impl {
     use super::common;
     use super::common::{PinGuard, StopMode};
 
+    const BGID: u16 = 7;
+
     pub fn run() {
         let stop = StopMode::from_args(1_000_000);
         let payload: usize = common::arg_or("--payload", 64);
@@ -97,7 +99,8 @@ mod linux_impl {
         eprintln!("=========================================================");
         eprintln!(" stop      : {}", stop.describe());
         eprintln!(" payload   : {payload}B");
-        eprintln!(" buf_ring  : {buf_entries} × {buf_size}B = {} KiB pool",
+        eprintln!(
+            " buf_ring  : {buf_entries} × {buf_size}B = {} KiB pool",
             (u32::from(buf_entries) * buf_size) / 1024
         );
         eprintln!(" server-cpu: {server_cpu}");
@@ -114,14 +117,20 @@ mod linux_impl {
             chunk_buf.len() / 1024
         );
 
-        let listener =
-            TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).expect("bind");
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).expect("bind");
         let addr = listener.local_addr().expect("local_addr");
-        let server =
-            common::spawn_ws_stream_server(listener, 1, chunk_buf.clone(), Some(server_cpu));
+        let server = common::spawn_ws_stream_server(listener, 1, chunk_buf, Some(server_cpu));
         eprintln!("[bench] fresh stream server on {addr}");
 
-        let outcome = run_raw(addr, stop, payload, user_cpu, sq_poll_cpu, buf_size, buf_entries);
+        let outcome = run_raw(
+            addr,
+            stop,
+            payload,
+            user_cpu,
+            sq_poll_cpu,
+            buf_size,
+            buf_entries,
+        );
         server.join().expect("server panic");
 
         println!();
@@ -175,7 +184,6 @@ mod linux_impl {
         };
         let mut proactor = Proactor::new(cfg).expect("proactor");
 
-        const BGID: u16 = 7;
         let mut buf_ring =
             BufferRing::new(&mut proactor, BGID, buf_entries, buf_size).expect("buf_ring");
 
@@ -234,7 +242,13 @@ mod linux_impl {
             // SAFETY: tmp 活在 fn 内
             unsafe {
                 proactor
-                    .submit_recv(fd, tmp.as_mut_ptr(), tmp.len() as u32, ud_recv, SqeFlags::NONE)
+                    .submit_recv(
+                        fd,
+                        tmp.as_mut_ptr(),
+                        tmp.len() as u32,
+                        ud_recv,
+                        SqeFlags::NONE,
+                    )
                     .expect("recv upgrade");
             }
             proactor.submit_and_wait(1).expect("recv wait");
@@ -325,16 +339,13 @@ mod linux_impl {
             let mut rearm_needed = false;
             let mut chunks: Vec<(u16, usize)> = Vec::with_capacity(32);
             proactor.drain_completions(|c| {
-                let res = match c.to_result() {
-                    Ok(n) => n,
+                let Ok(res) = c.to_result() else {
                     // -ENOBUFS：multishot 在 buffer ring 空时退出，has_more=false，
                     // 主循环检测到后 re-arm。loopback 高速场景下偶尔会跑出来。
-                    Err(_) => {
-                        if !c.has_more() {
-                            rearm_needed = true;
-                        }
-                        return;
+                    if !c.has_more() {
+                        rearm_needed = true;
                     }
+                    return;
                 };
                 if res == 0 {
                     if !c.has_more() {
@@ -369,17 +380,10 @@ mod linux_impl {
             frame_count as f64 / elapsed.as_secs_f64()
         );
 
-        // ── 清理：unregister buf_ring 后 close ───────────────────────────
+        // ── 清理：unregister buf_ring 后同步 close ───────────────────────
+        // 已离开测量窗口，不需要为了 cleanup 再提交异步 Close SQE。
         let _ = buf_ring.unregister(&mut proactor);
-        let raw_fd = sock.as_raw_fd();
-        std::mem::forget(sock);
-        let close_ud = UserData::new(OpKind::Close, 0);
-        // SAFETY: sock 已 forget，fd 无别的 RAII tracker
-        unsafe {
-            proactor.submit_close_raw(raw_fd, close_ud).expect("close");
-        }
-        proactor.submit_and_wait(1).expect("close wait");
-        proactor.drain_completions(|_| {});
+        drop(sock);
 
         let inter_arrival = common::inter_arrival_hist(&arrivals);
         Outcome {
@@ -394,7 +398,7 @@ mod linux_impl {
         let bytes = s.as_bytes();
         let mut out = String::with_capacity(s.len() + s.len() / 3);
         for (i, &b) in bytes.iter().enumerate() {
-            if i > 0 && (bytes.len() - i) % 3 == 0 {
+            if i > 0 && (bytes.len() - i).is_multiple_of(3) {
                 out.push(',');
             }
             out.push(b as char);

@@ -203,7 +203,9 @@ impl Proactor {
     /// 视该 fd 为 leak。生产代码通常会 `submit_and_wait` 推空 SQ 再 retry。
     pub fn submit_close(&mut self, fd: OwnedFd, user_data: UserData) -> Result<(), ProactorError> {
         let raw = fd.into_raw_fd();
-        let entry = opcode::Close::new(Fd(raw)).build().user_data(user_data.raw());
+        let entry = opcode::Close::new(Fd(raw))
+            .build()
+            .user_data(user_data.raw());
         // SAFETY: SubmissionQueue::push 的 unsafe 约束是 entry 内部资源有效；
         // Close 不含 buffer 指针，恒满足。
         unsafe {
@@ -221,8 +223,14 @@ impl Proactor {
     /// # Safety
     ///
     /// `fd` 必须是当前进程独占持有、未被任何 RAII wrapper 还在追踪的 fd。
-    pub unsafe fn submit_close_raw(&mut self, fd: RawFd, user_data: UserData) -> Result<(), ProactorError> {
-        let entry = opcode::Close::new(Fd(fd)).build().user_data(user_data.raw());
+    pub unsafe fn submit_close_raw(
+        &mut self,
+        fd: RawFd,
+        user_data: UserData,
+    ) -> Result<(), ProactorError> {
+        let entry = opcode::Close::new(Fd(fd))
+            .build()
+            .user_data(user_data.raw());
         // SAFETY: 同 submit_close
         unsafe {
             self.ring
@@ -315,7 +323,9 @@ impl Proactor {
     /// 系统调用，等于抹掉 SQ_POLL 的好处。如果 caller 想要 SQ_POLL 实际生效，
     /// 用 [`submit`](Self::submit) + [`wait_for_cqe`](Self::wait_for_cqe) 拆开。
     pub fn submit_and_wait(&mut self, wait_nr: usize) -> Result<usize, ProactorError> {
-        self.ring.submit_and_wait(wait_nr).map_err(ProactorError::Submit)
+        self.ring
+            .submit_and_wait(wait_nr)
+            .map_err(ProactorError::Submit)
     }
 
     /// 仅 submit（不等 CQE）。返回 kernel 实际收到的 SQE 数。
@@ -326,7 +336,10 @@ impl Proactor {
     ///
     /// 非 SQ_POLL 模式：等价于 `submit_and_wait(0)`。
     pub fn submit(&mut self) -> Result<usize, ProactorError> {
-        self.ring.submitter().submit().map_err(ProactorError::Submit)
+        self.ring
+            .submitter()
+            .submit()
+            .map_err(ProactorError::Submit)
     }
 
     /// 仅等 CQE，不 submit 任何新 SQE。若已有 ≥1 个 ready CQE 则立即返回。
@@ -343,7 +356,9 @@ impl Proactor {
         // io-uring crate 的 `submit_with_args` 是底层；这里用 submit_and_wait(N) +
         // 先调 submit() 把已有 SQE 推出去（多数情况 SQ 是空的，submit 是 noop）。
         // 实测：SQ empty 时 submit_and_wait 等价于纯 wait，开销与单独 wait 持平。
-        self.ring.submit_and_wait(wait_nr).map_err(ProactorError::Submit)
+        self.ring
+            .submit_and_wait(wait_nr)
+            .map_err(ProactorError::Submit)
     }
 
     /// 取走所有 ready CQE，对每个调一次 `sink`。返回取走个数。
@@ -401,7 +416,11 @@ mod tests {
         let c = got.expect("one completion");
         assert_eq!(c.user_data.kind(), Some(OpKind::Connect));
         assert_eq!(c.user_data.token(), 1);
-        assert_eq!(c.result, 0, "connect should succeed (errno = {})", -c.result);
+        assert_eq!(
+            c.result, 0,
+            "connect should succeed (errno = {})",
+            -c.result
+        );
 
         // listener accept 一下，确认确实建上了
         let (_peer, _) = listener.accept().unwrap();
@@ -483,7 +502,9 @@ mod tests {
     #[test]
     fn drain_empty_cq_returns_zero() {
         let mut proactor = Proactor::new(ProactorConfig::default()).unwrap();
-        let n = proactor.drain_completions(|_| panic!("sink called on empty CQ"));
+        let mut sink_called = false;
+        let n = proactor.drain_completions(|_| sink_called = true);
         assert_eq!(n, 0);
+        assert!(!sink_called);
     }
 }

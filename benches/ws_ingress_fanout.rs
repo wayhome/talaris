@@ -149,11 +149,7 @@ mod linux_impl {
                 run_tokio(addr, n, stop, payload, tokio_cpu)
             });
 
-            rows.push(Row {
-                n,
-                talaris,
-                tokio,
-            });
+            rows.push(Row { n, talaris, tokio });
         }
 
         println!();
@@ -205,15 +201,9 @@ mod linux_impl {
         chunk_buf: Arc<Vec<u8>>,
         body: impl FnOnce(SocketAddr) -> R,
     ) -> R {
-        let listener =
-            TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).expect("bind");
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).expect("bind");
         let addr = listener.local_addr().expect("local_addr");
-        let server = common::spawn_ws_stream_server(
-            listener,
-            n_conns,
-            chunk_buf,
-            Some(server_cpu),
-        );
+        let server = common::spawn_ws_stream_server(listener, n_conns, chunk_buf, Some(server_cpu));
         let result = body(addr);
         server.join().expect("server panic");
         result
@@ -328,6 +318,8 @@ mod linux_impl {
             let mut handles = Vec::with_capacity(n_conns as usize);
             for _ in 0..n_conns {
                 let h = tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt;
+
                     let mut s = TcpStream::connect(addr).await.expect("connect");
                     s.set_nodelay(true).expect("nodelay");
                     let leftover = common::tokio_ws_upgrade_client(&mut s, "localhost", "/")
@@ -341,7 +333,6 @@ mod linux_impl {
                         bench_start,
                     )
                     .await;
-                    use tokio::io::AsyncWriteExt;
                     let _ = s.shutdown().await;
                     (arr, cnt)
                 });
@@ -380,7 +371,7 @@ mod linux_impl {
         let bytes = s.as_bytes();
         let mut out = String::with_capacity(s.len() + s.len() / 3);
         for (i, &b) in bytes.iter().enumerate() {
-            if i > 0 && (bytes.len() - i) % 3 == 0 {
+            if i > 0 && (bytes.len() - i).is_multiple_of(3) {
                 out.push(',');
             }
             out.push(b as char);

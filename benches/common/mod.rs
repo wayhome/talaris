@@ -650,9 +650,10 @@ pub async fn tokio_tls_ws_upgrade_client(
     use std::io::Write as _;
 
     let mut network_buf = vec![0_u8; 256 * 1024];
+    let mut plaintext = Vec::<u8>::new();
     while tls.is_handshaking() {
         flush_tokio_tls(s, tls).await?;
-        read_tokio_tls(s, tls, &mut network_buf).await?;
+        read_tokio_tls(s, tls, &mut network_buf, &mut plaintext).await?;
     }
 
     let key = talaris::ws::handshake::generate_key()
@@ -668,10 +669,8 @@ pub async fn tokio_tls_ws_upgrade_client(
     tls.writer().write_all(req.as_bytes())?;
     flush_tokio_tls(s, tls).await?;
 
-    let mut plaintext = Vec::<u8>::new();
     loop {
-        read_tokio_tls(s, tls, &mut network_buf).await?;
-        drain_tls_plaintext(tls, &mut plaintext)?;
+        read_tokio_tls(s, tls, &mut network_buf, &mut plaintext).await?;
         if let Some(idx) = plaintext.windows(4).position(|w| w == b"\r\n\r\n") {
             let header_end = idx + 4;
             return Ok(plaintext[header_end..].to_vec());
@@ -727,12 +726,8 @@ pub async fn tokio_recv_tls_ws_binary_frames(
         if !stop.keep_going(frame_count, bench_start) {
             break;
         }
-        if let Err(e) = read_tokio_tls(s, tls, &mut network_buf).await {
+        if let Err(e) = read_tokio_tls(s, tls, &mut network_buf, &mut plaintext).await {
             eprintln!("[tokio_tls_recv] read error after {frame_count}: {e}");
-            break;
-        }
-        if let Err(e) = drain_tls_plaintext(tls, &mut plaintext) {
-            eprintln!("[tokio_tls_recv] plaintext error after {frame_count}: {e}");
             break;
         }
     }
@@ -745,6 +740,7 @@ async fn read_tokio_tls(
     s: &mut tokio::net::TcpStream,
     tls: &mut rustls::ClientConnection,
     network_buf: &mut [u8],
+    plaintext: &mut Vec<u8>,
 ) -> std::io::Result<()> {
     use tokio::io::AsyncReadExt as _;
 
@@ -759,6 +755,7 @@ async fn read_tokio_tls(
             break;
         }
         tls.process_new_packets().map_err(std::io::Error::other)?;
+        drain_tls_plaintext(tls, plaintext)?;
     }
     flush_tokio_tls(s, tls).await
 }

@@ -1070,10 +1070,10 @@ async fn tokio_ktls_read_application_data(
     loop {
         s.readable().await?;
         match s.try_io(Interest::READABLE, || recv_ktls_record(s, buf)) {
-            Ok(Ok((n, None | Some(23)))) => return Ok(n),
-            Ok(Ok((_n, Some(_control_record)))) => {}
-            Ok(Err(e)) => return Err(e),
-            Err(_would_block) => {}
+            Ok((n, None | Some(23))) => return Ok(n),
+            Ok((_n, Some(_control_record))) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e),
         }
     }
 }
@@ -1085,7 +1085,8 @@ fn recv_ktls_record(
 ) -> std::io::Result<(usize, Option<u8>)> {
     use std::os::fd::AsRawFd as _;
 
-    const CONTROL_SPACE: usize = libc::CMSG_SPACE(1) as usize;
+    // SAFETY: one byte is a valid ancillary-data payload size.
+    const CONTROL_SPACE: usize = unsafe { libc::CMSG_SPACE(1) as usize };
 
     let mut control = [0_u8; CONTROL_SPACE];
     let mut iov = libc::iovec {

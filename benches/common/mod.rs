@@ -645,7 +645,7 @@ pub async fn tokio_recv_ws_binary_frames(
 
 #[cfg(target_os = "linux")]
 pub async fn tokio_recv_ktls_ws_binary_frames_sampled(
-    s: &mut tokio::net::TcpStream,
+    s: &tokio::net::TcpStream,
     initial_leftover: Vec<u8>,
     stop: StopMode,
     expected_payload: usize,

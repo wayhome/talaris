@@ -429,7 +429,7 @@ mod linux_impl {
 
             let bench_start = Instant::now();
             let (arrivals, frame_count) = common::tokio_recv_ktls_ws_binary_frames_sampled(
-                &mut stream,
+                &stream,
                 leftover,
                 stop,
                 payload,

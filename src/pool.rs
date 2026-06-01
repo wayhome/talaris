@@ -411,13 +411,6 @@ impl Pool {
             }
         }
 
-        // Catch events that were already buffered before this CQ batch. The common recv path
-        // already drained inline above; this loop is normally a cheap no-op.
-        for slot in conns.iter_mut() {
-            let Some(conn) = slot.as_mut() else { continue };
-            drain_conn_data_events(conn, &mut sink, &mut first_err);
-        }
-
         sync_active_count(conns, active_count);
         first_err.map_or(Ok(()), Err)
     }
@@ -453,11 +446,6 @@ impl Pool {
                 &mut first_err,
             );
             progressed |= cqes > 0;
-
-            for slot in conns.iter_mut() {
-                let Some(conn) = slot.as_mut() else { continue };
-                progressed |= drain_conn_data_events(conn, &mut sink, &mut first_err) > 0;
-            }
 
             if progressed || first_err.is_some() {
                 break;

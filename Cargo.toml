@@ -70,6 +70,7 @@ opt-level     = 3
 lto           = "thin"
 codegen-units = 1
 debug         = true
+strip         = false
 
 # ─── bench targets ──────────────────────────────────────────────────────
 # 全部 `harness = false`：自己写 fn main()，HdrHistogram + Instant 自己测时间，

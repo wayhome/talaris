@@ -107,6 +107,20 @@ pub fn inter_arrival_hist(arrivals: &[Instant]) -> Histogram<u64> {
     h
 }
 
+pub fn sampled_arrivals(stop: StopMode, sample_every: u64) -> Vec<Instant> {
+    if sample_every == 0 {
+        return Vec::new();
+    }
+    let divisor = usize::try_from(sample_every).unwrap_or(usize::MAX);
+    Vec::with_capacity(stop.cap_hint().div_ceil(divisor))
+}
+
+pub fn record_sampled_arrival(arrivals: &mut Vec<Instant>, frame_count: u64, sample_every: u64) {
+    if sample_every > 0 && frame_count.is_multiple_of(sample_every) {
+        arrivals.push(Instant::now());
+    }
+}
+
 // ─── CLI ─────────────────────────────────────────────────────────────────
 
 pub fn arg_opt<T: std::str::FromStr>(key: &str) -> Option<T> {
@@ -685,11 +699,12 @@ pub async fn tokio_recv_tls_ws_binary_frames(
     initial_leftover: Vec<u8>,
     stop: StopMode,
     expected_payload: usize,
+    sample_every: u64,
     bench_start: Instant,
 ) -> (Vec<Instant>, u64) {
     use talaris::ws::frame::parse_header;
 
-    let mut arrivals: Vec<Instant> = Vec::with_capacity(stop.cap_hint());
+    let mut arrivals = sampled_arrivals(stop, sample_every);
     let mut frame_count = 0_u64;
     let mut network_buf = vec![0_u8; 256 * 1024];
     let mut plaintext = initial_leftover;
@@ -705,8 +720,8 @@ pub async fn tokio_recv_tls_ws_binary_frames(
                         break;
                     }
                     debug_assert_eq!(hdr.payload_len as usize, expected_payload);
-                    arrivals.push(Instant::now());
                     frame_count += 1;
+                    record_sampled_arrival(&mut arrivals, frame_count, sample_every);
                     pos += total;
                     if !stop.keep_going(frame_count, bench_start) {
                         plaintext.drain(..pos);

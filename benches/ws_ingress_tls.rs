@@ -68,6 +68,7 @@ mod linux_impl {
         let sq_poll_cpu: u32 = common::arg_or("--sq-poll-cpu", 5);
         let tokio_cpu: usize = common::arg_or("--tokio-cpu", 2);
         let spin_iters: usize = common::arg_or("--spin-iters", 256);
+        let sample_every: u64 = common::arg_or("--sample-every", 1);
         let buf_size: u32 = common::arg_or("--buf-size", 8192);
         let buf_entries: u16 = common::arg_or("--buf-entries", 256);
 
@@ -80,6 +81,7 @@ mod linux_impl {
         eprintln!(" talaris   : user->CPU {talaris_cpu}, SQ_POLL->CPU {sq_poll_cpu}");
         eprintln!(" tokio     : worker->CPU {tokio_cpu}");
         eprintln!(" spin_iters: {spin_iters}");
+        eprintln!(" samples   : every {sample_every} frame(s), 0 disables");
         eprintln!(
             " buf_ring  : {buf_entries} x {buf_size}B = {} KiB pool",
             (u32::from(buf_entries) * buf_size) / 1024
@@ -109,6 +111,7 @@ mod linux_impl {
                 sq_poll_cpu,
                 buf_size,
                 buf_entries,
+                sample_every,
                 None,
             )
         });
@@ -124,6 +127,7 @@ mod linux_impl {
                 sq_poll_cpu,
                 buf_size,
                 buf_entries,
+                sample_every,
                 Some(spin_iters),
             )
         });
@@ -131,7 +135,7 @@ mod linux_impl {
 
         eprintln!("--- variant 3/3: tokio + rustls ---");
         let tokio = with_fresh_tls_server(server_cpu, chunk_buf, |addr| {
-            run_tokio(addr, stop, payload, tokio_cpu)
+            run_tokio(addr, stop, payload, tokio_cpu, sample_every)
         });
 
         println!();
@@ -173,6 +177,11 @@ mod linux_impl {
             ("talaris data spin", &talaris_spin.inter_arrival),
             ("tokio + rustls", &tokio.inter_arrival),
         ]);
+        if sample_every != 1 {
+            println!(
+                "sampled intervals are diagnostic only; use --sample-every 1 for adjacent-frame jitter."
+            );
+        }
     }
 
     fn with_fresh_tls_server<R>(
@@ -198,6 +207,7 @@ mod linux_impl {
         sq_poll_cpu: u32,
         buf_size: u32,
         buf_entries: u16,
+        sample_every: u64,
         spin_iters: Option<usize>,
     ) -> Outcome {
         let label = if spin_iters.is_some() {
@@ -217,7 +227,7 @@ mod linux_impl {
             .expect("TLS + WS connect");
         assert_eq!(pool.state(h), Some(State::Open));
 
-        let mut arrivals: Vec<Instant> = Vec::with_capacity(stop.cap_hint());
+        let mut arrivals = common::sampled_arrivals(stop, sample_every);
         let mut frame_count = 0_u64;
         let bench_start = Instant::now();
         if let Some(spin_iters) = spin_iters {
@@ -225,8 +235,8 @@ mod linux_impl {
                 pool.pump_data_spin(spin_iters, |_h, ev| {
                     if let WsDataEvent::Binary(data) = ev {
                         debug_assert_eq!(data.len(), payload);
-                        arrivals.push(Instant::now());
                         frame_count += 1;
+                        common::record_sampled_arrival(&mut arrivals, frame_count, sample_every);
                     }
                 })
                 .expect("pump_data_spin");
@@ -236,8 +246,8 @@ mod linux_impl {
                 pool.pump_data(|_h, ev| {
                     if let WsDataEvent::Binary(data) = ev {
                         debug_assert_eq!(data.len(), payload);
-                        arrivals.push(Instant::now());
                         frame_count += 1;
+                        common::record_sampled_arrival(&mut arrivals, frame_count, sample_every);
                     }
                 })
                 .expect("pump_data");
@@ -260,7 +270,13 @@ mod linux_impl {
         }
     }
 
-    fn run_tokio(addr: SocketAddr, stop: StopMode, payload: usize, user_cpu: usize) -> Outcome {
+    fn run_tokio(
+        addr: SocketAddr,
+        stop: StopMode,
+        payload: usize,
+        user_cpu: usize,
+        sample_every: u64,
+    ) -> Outcome {
         let _guard = PinGuard::pin("tokio-tls", user_cpu);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_io()
@@ -285,6 +301,7 @@ mod linux_impl {
                 leftover,
                 stop,
                 payload,
+                sample_every,
                 bench_start,
             )
             .await;

@@ -1,8 +1,8 @@
 //! `Pool` —— multi-conn 驱动
 //!
 //! 一个 [`Proactor`] 服务同 venue 的多条 WS。CQE 通过
-//! [`UserData::token`] 低 28 位编码 conn_id；Pool drain 后按 id 路由到对应
-//! [`ConnectionState`]。
+//! [`crate::proactor::UserData::token`] 低 28 位编码 conn_id；Pool drain 后按 id
+//! 路由到对应 `ConnectionState`。
 //!
 //! ## 关键不变式
 //!
@@ -21,11 +21,10 @@
 //! 本文件落地 plan.md "Network Pool 详细设计" 的 Migration Step 1：skeleton +
 //! ConnectionState 拆分。
 //!
-//! - 单 conn 路径与 [`Connection`] 等价（[`Connection`] 已转为 thin wrapper）。
+//! - 单 conn 路径与旧版单连接 wrapper 等价。
 //! - 多 conn pump 已能跑（CQE 按 conn_id 路由）。
 //! - 还未做：slot 复用 / Tombstone / pool 内重连 / 多 venue 共 Pool。
 //!
-//! [`Connection`]: crate::connection::Connection
 //! [`UserData`]: crate::proactor::UserData
 
 // `expect()` 用法均为 invariant 断言（just-pushed conn 一定存在；28-bit mask
@@ -38,7 +37,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use crate::connection::{ConnectionConfig, ConnectionError, State};
 use crate::connection_state::ConnectionState;
 use crate::proactor::{Completion, Proactor, ProactorConfig, ProactorError};
-use crate::ws::Event as WsEvent;
+use crate::ws::{ConnState as WsConnState, DataEvent as WsDataEvent, Event as WsEvent};
 
 /// CQE.token() 中 conn_id 的位掩码 —— 28 bit，最多 ~2.6 亿条 conn / Pool，
 /// 远超任何实际场景。bits 55..28 预留给 op-seq dedup（v1 不使用）。
@@ -78,7 +77,7 @@ impl ConnHandle {
     }
 }
 
-/// Multi-conn driver。单线程持有 [`Proactor`] + N 条 [`ConnectionState`]。
+/// Multi-conn driver。单线程持有 [`Proactor`] + N 条 `ConnectionState`。
 ///
 /// **Slot table 路由**（P2）：`conns: Vec<Option<ConnectionState>>`，conn_id
 /// 既是 routing token 也是 slot index —— CQE 拿到 user_data 解出 conn_id 后
@@ -127,11 +126,14 @@ impl Pool {
     }
 
     /// 加一条 conn，阻塞跑到 [`State::Open`] 才返。失败时 slot 置 None
-    /// （中途产生的 fd 由 [`ConnectionState`] drop 关闭）。
+    /// （中途产生的 fd 由 `ConnectionState` drop 关闭）。
     ///
     /// `cfg.proactor` 字段在此忽略——proactor 由 Pool 持有。`cfg.conn_id` /
     /// `cfg.bgid` 也会被 Pool 覆盖为内部分配的值。
-    pub fn connect_blocking(&mut self, cfg: ConnectionConfig) -> Result<ConnHandle, ConnectionError> {
+    pub fn connect_blocking(
+        &mut self,
+        cfg: ConnectionConfig,
+    ) -> Result<ConnHandle, ConnectionError> {
         let addr = resolve_addr(&cfg)?;
         self.connect_blocking_to(cfg, addr)
     }
@@ -194,6 +196,9 @@ impl Pool {
             return Err(ConnectionError::IdSpaceExhausted("conn_id"));
         }
         let bgid = self.next_bgid;
+        let Some(next_bgid) = self.next_bgid.checked_add(1) else {
+            return Err(ConnectionError::IdSpaceExhausted("bgid"));
+        };
         cfg.conn_id = conn_id;
         cfg.bgid = bgid;
 
@@ -205,15 +210,10 @@ impl Pool {
         debug_assert_eq!(self.conns.len(), conn_id as usize);
         self.conns.push(Some(conn));
         self.active_count += 1;
-        // 计数器单调推进。bgid 用 checked_add 防 u16 溢出 —— 真撞上时同步
-        // 把刚 push 的 slot 摘掉，避免留下"已提交 SQE 但 Pool 不再持有 conn"的
-        // 半完成状态。
+        // 计数器单调推进。bgid 溢出必须在提交 SQE 前检查，避免留下
+        // "已提交 connect 但 Pool 不再持有 conn" 的半完成状态。
         self.next_conn_id = conn_id + 1;
-        let Some(next) = self.next_bgid.checked_add(1) else {
-            self.drop_slot(conn_id);
-            return Err(ConnectionError::IdSpaceExhausted("bgid"));
-        };
-        self.next_bgid = next;
+        self.next_bgid = next_bgid;
         Ok(ConnHandle(conn_id))
     }
 
@@ -254,18 +254,37 @@ impl Pool {
     pub fn send_text(&mut self, h: ConnHandle, payload: &[u8]) -> Result<(), ConnectionError> {
         let conn = self.conn_mut(h)?;
         conn.assert_open()?;
-        conn.ws.send_text(payload);
+        conn.ws.send_text(payload)?;
         Ok(())
     }
 
     pub fn send_binary(&mut self, h: ConnHandle, payload: &[u8]) -> Result<(), ConnectionError> {
         let conn = self.conn_mut(h)?;
         conn.assert_open()?;
-        conn.ws.send_binary(payload);
+        conn.ws.send_binary(payload)?;
         Ok(())
     }
 
-    pub fn initiate_close(&mut self, h: ConnHandle, code: u16, reason: &str) -> Result<(), ConnectionError> {
+    pub fn send_ping(&mut self, h: ConnHandle, payload: &[u8]) -> Result<(), ConnectionError> {
+        let conn = self.conn_mut(h)?;
+        conn.assert_open()?;
+        conn.ws.send_ping(payload)?;
+        Ok(())
+    }
+
+    pub fn send_pong(&mut self, h: ConnHandle, payload: &[u8]) -> Result<(), ConnectionError> {
+        let conn = self.conn_mut(h)?;
+        conn.assert_open()?;
+        conn.ws.send_pong(payload)?;
+        Ok(())
+    }
+
+    pub fn initiate_close(
+        &mut self,
+        h: ConnHandle,
+        code: u16,
+        reason: &str,
+    ) -> Result<(), ConnectionError> {
         let conn = self.conn_mut(h)?;
         // Closing / Closed 都是幂等 no-op：对端已先发 Close 时 ws 内部已 queue
         // 过 echo，再 send_close 会把第二个 Close frame 推上 wire（RFC §5.5.1
@@ -273,7 +292,7 @@ impl Pool {
         if matches!(conn.state(), State::Closed | State::Closing) {
             return Ok(());
         }
-        conn.ws.send_close(code, reason);
+        conn.ws.send_close(code, reason)?;
         if matches!(conn.state(), State::Open) {
             conn.state = State::Closing;
         }
@@ -294,49 +313,69 @@ impl Pool {
         self.pump_impl(0, sink)
     }
 
-    /// **Inbound fast path** —— 跟 [`pump`](Self::pump) 一样推进 io_uring，但
-    /// 每条 conn 的 ws 事件 drain 走 [`WsClient::drain_binary_frames`]：直接把
-    /// payload slice 交给 sink，不构造 `Event` enum，不走 fragmentation /
-    /// control / Close 状态机。
+    /// Busy-poll 版本的 [`pump`](Self::pump)。
     ///
-    /// 用于"订阅 client 收 server-side 行情"这种 server 几乎只发 FIN-Binary
-    /// 帧的 workload。**收到任何非 FIN-Binary 帧（Text / Ping / Pong / Close /
-    /// 分片）都判 protocol error**，这条 conn 自动 `Closed` 并 surface 错误。
+    /// 先提交 pending send / multishot rearm，然后最多轮询 `spin_iters + 1`
+    /// 次 CQ ring；期间不调用 [`Proactor::wait_for_cqe`]，因此不会为了等待
+    /// completion 进入 `io_uring_enter(GETEVENTS)`。这只适合 isolated CPU 上的
+    /// 高频 steady-state loop；低负载下会白烧 CPU。
     ///
-    /// HFT 数据流场景下 ~50% throughput 提升（实测 ws_ingress_single：13.4M f/s
-    /// → 18M+ f/s），代价是失去 fragmentation / control 自动处理。
-    ///
-    /// 与 `pump` **不互斥** —— 同一 Pool 上可以交替调用，建议：
-    /// - handshake 阶段：[`Self::connect_blocking_to`] 内部走通用路径
-    /// - 数据阶段：循环调 `pump_binary`
-    /// - 收尾 / close handshake：切回 `pump`
-    pub fn pump_binary<F>(&mut self, sink: F) -> Result<(), ConnectionError>
+    /// 返回值表示这一轮是否处理到了任何 CQE 或 WS event。caller 可以据此决定
+    /// 继续 busy-spin，或 fallback 到阻塞 [`pump`](Self::pump)。
+    pub fn pump_spin<F>(&mut self, spin_iters: usize, sink: F) -> Result<bool, ConnectionError>
     where
-        F: FnMut(ConnHandle, &[u8]),
+        F: FnMut(ConnHandle, WsEvent<'_>),
     {
-        self.pump_binary_impl(1, sink)
+        self.pump_spin_impl(spin_iters, sink)
     }
 
-    /// 同 [`pump_binary`](Self::pump_binary)，但 `wait_for_cqe(0)` —— 立刻返回，
+    /// Data-only pump：跟 [`pump`](Self::pump) 一样推进 io_uring 和完整 WebSocket
+    /// 状态机，但只把业务 data message 交给 sink。
+    ///
+    /// Text JSON 和 Binary SBE 都会被分发；Ping/Pong/Close、fragmentation、
+    /// auto-pong、UTF-8 校验等仍由 [`crate::ws::WsClient`] 正常处理。适合交易所
+    /// 行情主循环：业务代码只关心 data payload，但连接层不能忽略 control frame。
+    pub fn pump_data<F>(&mut self, sink: F) -> Result<(), ConnectionError>
+    where
+        F: FnMut(ConnHandle, WsDataEvent<'_>),
+    {
+        self.pump_data_impl(1, sink)
+    }
+
+    /// 同 [`pump_data`](Self::pump_data)，但 `wait_for_cqe(0)` —— 立刻返回，
     /// 没新 CQE 也不阻塞。配合 close handshake / 退出 cleanup 用。
-    pub fn pump_binary_nowait<F>(&mut self, sink: F) -> Result<(), ConnectionError>
+    pub fn pump_data_nowait<F>(&mut self, sink: F) -> Result<(), ConnectionError>
     where
-        F: FnMut(ConnHandle, &[u8]),
+        F: FnMut(ConnHandle, WsDataEvent<'_>),
     {
-        self.pump_binary_impl(0, sink)
+        self.pump_data_impl(0, sink)
     }
 
-    /// fast-path pump 实现。结构和 [`pump_impl`](Self::pump_impl) 一致，唯一区
-    /// 别是最后那一轮 per-conn drain 调 [`WsClient::drain_binary_frames`] 而非
-    /// `poll_event`，跳过 Event enum + 状态机。
-    fn pump_binary_impl<F>(&mut self, wait_nr: usize, mut sink: F) -> Result<(), ConnectionError>
+    /// Busy-poll 版本的 [`pump_data`](Self::pump_data)。
+    ///
+    /// 配合 SQ_POLL 时，submit 路径通常也是 userspace store；本方法本身只轮询
+    /// mmap 出来的 CQ ring，不调用 [`Proactor::wait_for_cqe`]。代价是 caller 所在
+    /// 线程会在没有 CQE 时持续占 CPU。
+    ///
+    /// 返回值表示这一轮是否处理到了任何 CQE 或 WS event。
+    pub fn pump_data_spin<F>(&mut self, spin_iters: usize, sink: F) -> Result<bool, ConnectionError>
     where
-        F: FnMut(ConnHandle, &[u8]),
+        F: FnMut(ConnHandle, WsDataEvent<'_>),
+    {
+        self.pump_data_spin_impl(spin_iters, sink)
+    }
+
+    /// data-only pump 实现。结构和 [`pump_impl`](Self::pump_impl) 一致，区别是
+    /// per-conn drain 调 [`WsClient::drain_data_events`]，只把 Text/Binary 交给业务。
+    fn pump_data_impl<F>(&mut self, wait_nr: usize, mut sink: F) -> Result<(), ConnectionError>
+    where
+        F: FnMut(ConnHandle, WsDataEvent<'_>),
     {
         let Self {
             proactor,
             conns,
             completions_buf,
+            active_count,
             ..
         } = self;
 
@@ -371,13 +410,69 @@ impl Pool {
         for slot in conns.iter_mut() {
             let Some(conn) = slot.as_mut() else { continue };
             let handle = ConnHandle(conn.conn_id());
-            if let Err(e) = conn.ws.drain_binary_frames(|payload| sink(handle, payload)) {
+            if let Err(e) = conn.ws.drain_data_events(|ev| sink(handle, ev)) {
                 fail_conn(conn, ConnectionError::Ws(e), &mut first_err);
             }
             conn.sync_ws_close_state();
         }
 
+        sync_active_count(conns, active_count);
         first_err.map_or(Ok(()), Err)
+    }
+
+    fn pump_data_spin_impl<F>(
+        &mut self,
+        spin_iters: usize,
+        mut sink: F,
+    ) -> Result<bool, ConnectionError>
+    where
+        F: FnMut(ConnHandle, WsDataEvent<'_>),
+    {
+        let Self {
+            proactor,
+            conns,
+            completions_buf,
+            active_count,
+            ..
+        } = self;
+
+        let mut first_err: Option<ConnectionError> = None;
+        let mut progressed = false;
+
+        submit_conn_ops(conns, proactor, &mut first_err);
+        proactor.submit()?;
+
+        for iter in 0..=spin_iters {
+            let cqes = drain_conn_completions(conns, proactor, completions_buf, &mut first_err);
+            progressed |= cqes > 0;
+
+            for slot in conns.iter_mut() {
+                let Some(conn) = slot.as_mut() else { continue };
+                let handle = ConnHandle(conn.conn_id());
+                match conn.ws.drain_data_events(|ev| sink(handle, ev)) {
+                    Ok(events) => {
+                        progressed |= events > 0;
+                    }
+                    Err(e) => {
+                        fail_conn(conn, ConnectionError::Ws(e), &mut first_err);
+                    }
+                }
+                conn.sync_ws_close_state();
+            }
+
+            if progressed || first_err.is_some() {
+                break;
+            }
+            if iter < spin_iters {
+                std::hint::spin_loop();
+            }
+        }
+
+        sync_active_count(conns, active_count);
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(progressed),
+        }
     }
 
     /// 推进一次：所有 conn 的 pending send / multishot rearm → submit_and_wait
@@ -397,6 +492,7 @@ impl Pool {
             proactor,
             conns,
             completions_buf,
+            active_count,
             ..
         } = self;
 
@@ -427,7 +523,8 @@ impl Pool {
         completions_buf.clear();
         proactor.drain_completions(|c| completions_buf.push(c));
         for &c in completions_buf.iter() {
-            let conn_id = u32::try_from(c.user_data.token() & CONN_ID_MASK).expect("28-bit mask fits u32");
+            let conn_id =
+                u32::try_from(c.user_data.token() & CONN_ID_MASK).expect("28-bit mask fits u32");
             // Slot-table O(1) lookup（早期 iter().find 是 O(N)）。
             // stale CQE（已 close 的 conn 残留）落到 None 分支 → 忽略
             if let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut)
@@ -453,7 +550,61 @@ impl Pool {
             conn.sync_ws_close_state();
         }
 
+        sync_active_count(conns, active_count);
         first_err.map_or(Ok(()), Err)
+    }
+
+    fn pump_spin_impl<F>(&mut self, spin_iters: usize, mut sink: F) -> Result<bool, ConnectionError>
+    where
+        F: FnMut(ConnHandle, WsEvent<'_>),
+    {
+        let Self {
+            proactor,
+            conns,
+            completions_buf,
+            active_count,
+            ..
+        } = self;
+
+        let mut first_err: Option<ConnectionError> = None;
+        let mut progressed = false;
+
+        submit_conn_ops(conns, proactor, &mut first_err);
+        proactor.submit()?;
+
+        for iter in 0..=spin_iters {
+            let cqes = drain_conn_completions(conns, proactor, completions_buf, &mut first_err);
+            progressed |= cqes > 0;
+
+            for slot in conns.iter_mut() {
+                let Some(conn) = slot.as_mut() else { continue };
+                let handle = ConnHandle(conn.conn_id());
+                while let Some(res) = conn.ws.poll_event() {
+                    progressed = true;
+                    match res {
+                        Ok(ev) => sink(handle, ev),
+                        Err(e) => {
+                            fail_conn(conn, ConnectionError::Ws(e), &mut first_err);
+                            break;
+                        }
+                    }
+                }
+                conn.sync_ws_close_state();
+            }
+
+            if progressed || first_err.is_some() {
+                break;
+            }
+            if iter < spin_iters {
+                std::hint::spin_loop();
+            }
+        }
+
+        sync_active_count(conns, active_count);
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(progressed),
+        }
     }
 
     pub fn state(&self, h: ConnHandle) -> Option<State> {
@@ -484,6 +635,43 @@ fn resolve_addr(cfg: &ConnectionConfig) -> Result<SocketAddr, ConnectionError> {
         .ok_or_else(|| ConnectionError::DnsEmpty(cfg.host.clone()))
 }
 
+fn submit_conn_ops(
+    conns: &mut [Option<ConnectionState>],
+    proactor: &mut Proactor,
+    first_err: &mut Option<ConnectionError>,
+) {
+    for slot in conns.iter_mut() {
+        let Some(conn) = slot.as_mut() else { continue };
+        if let Err(e) = conn.try_submit_send(proactor) {
+            fail_conn(conn, e, first_err);
+            continue;
+        }
+        if let Err(e) = conn.try_rearm_multishot(proactor) {
+            fail_conn(conn, e, first_err);
+        }
+    }
+}
+
+fn drain_conn_completions(
+    conns: &mut [Option<ConnectionState>],
+    proactor: &mut Proactor,
+    completions_buf: &mut Vec<Completion>,
+    first_err: &mut Option<ConnectionError>,
+) -> usize {
+    completions_buf.clear();
+    let count = proactor.drain_completions(|c| completions_buf.push(c));
+    for &c in completions_buf.iter() {
+        let conn_id =
+            u32::try_from(c.user_data.token() & CONN_ID_MASK).expect("28-bit mask fits u32");
+        if let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut)
+            && let Err(e) = conn.handle_completion(proactor, c)
+        {
+            fail_conn(conn, e, first_err);
+        }
+    }
+    count
+}
+
 /// pump 内 per-conn 错误处理：保留第一条错误，把对应 conn 推到 Closed 以便
 /// 下一轮 submit/rearm short-circuit；这条 conn 在 kernel 端可能仍有 in-flight
 /// op，不强制 cancel（Drop / 显式 close 时清理）。
@@ -492,11 +680,27 @@ fn fail_conn(
     err: ConnectionError,
     first_err: &mut Option<ConnectionError>,
 ) {
-    tracing::warn!(conn_id = conn.conn_id(), error = %err, "pool conn failed; marking Closed");
-    conn.state = State::Closed;
+    tracing::warn!(conn_id = conn.conn_id(), error = %err, "pool conn failed");
+    let ws_close_in_progress = matches!(conn.ws.state(), WsConnState::Closing);
+    conn.state = if ws_close_in_progress {
+        State::Closing
+    } else {
+        State::Closed
+    };
     if first_err.is_none() {
         *first_err = Some(err);
     }
+}
+
+fn sync_active_count(conns: &[Option<ConnectionState>], active_count: &mut u32) {
+    let count = conns
+        .iter()
+        .filter(|slot| {
+            slot.as_ref()
+                .is_some_and(|conn| !matches!(conn.state(), State::Closed))
+        })
+        .count();
+    *active_count = u32::try_from(count).unwrap_or(u32::MAX);
 }
 
 impl Drop for Pool {
@@ -526,6 +730,7 @@ mod tests {
     use super::*;
     use crate::connection::{ConnectionConfig, State};
     use crate::test_helpers::run_echo_server;
+    use crate::ws::DataEvent as WsDataEvent;
     use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
     use std::sync::mpsc;
     use std::thread;
@@ -549,9 +754,9 @@ mod tests {
 
         let mut got_text: Option<String> = None;
         for _ in 0..50 {
-            pool.pump(|h, ev| {
+            pool.pump_data(|h, ev| {
                 assert_eq!(h, handle);
-                if let WsEvent::Text(s) = ev {
+                if let WsDataEvent::Text(s) = ev {
                     got_text = Some(s.to_owned());
                 }
             })
@@ -586,7 +791,9 @@ mod tests {
     fn tls_smoke_deribit_testnet() {
         let cfg = ConnectionConfig::new("test.deribit.com", 443, "/ws/api/v2");
         let mut pool = Pool::new(PoolConfig::new(cfg.proactor)).expect("pool");
-        let handle = pool.connect_blocking(cfg).expect("tls handshake + ws upgrade");
+        let handle = pool
+            .connect_blocking(cfg)
+            .expect("tls handshake + ws upgrade");
         assert_eq!(pool.state(handle), Some(State::Open));
         eprintln!("TLS+WS handshake OK, sending public/test ...");
 
@@ -678,7 +885,10 @@ mod tests {
             }
         }
 
-        assert!(!wrong_route, "CQE 路由错位：handle 收到了不属于它的 payload");
+        assert!(
+            !wrong_route,
+            "CQE 路由错位：handle 收到了不属于它的 payload"
+        );
         assert_eq!(a_text.as_deref(), Some("alpha"));
         assert_eq!(b_text.as_deref(), Some("bravo"));
 

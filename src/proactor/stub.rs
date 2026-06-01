@@ -3,8 +3,8 @@
 //! io_uring 是 Linux-only。本 stub 让本地（macOS）`cargo check` / IDE 服务仍能过，
 //! 但任何实际调用都会 `unimplemented!()`。CI / 生产构建必须在 Linux 上跑。
 //!
-//! 这里的类型签名和 [`super::uring`] / [`super::socket`] / [`super::op`] 严格
-//! 对齐，让上层代码不用 `cfg(target_os = "linux")` 包到处都是。
+//! 这里的类型签名和 [`super::uring`] / [`super::socket`] / [`super::op`] 严格 对齐，
+//! 让上层代码不用 `cfg(target_os = "linux")` 包到处都是。
 
 #![allow(dead_code, missing_debug_implementations)]
 // stub 文件本身的意义就是"调用即崩"占位；`unimplemented!()` 是这层的契约。

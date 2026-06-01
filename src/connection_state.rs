@@ -1,10 +1,9 @@
 //! `ConnectionState` —— Pool 内单条连接的状态机
 //!
-//! 从 [`crate::connection::Connection`] 拆出的"无 proactor 字段"版本。Pool 持
-//! 唯一 [`Proactor`]，各 conn 的 IO 方法接 `proactor: &mut Proactor` 参数。
+//! Pool 持唯一 [`Proactor`]，各 conn 的 IO 方法接 `proactor: &mut Proactor`
+//! 参数；公开 API 通过 [`crate::Pool`] + `ConnHandle` 操作连接。
 //!
-//! 不对外暴露——`pub(crate)`。业务面只透过 [`crate::Pool`] 或
-//! [`crate::Connection`] 操作。
+//! 不对外暴露——`pub(crate)`。
 //!
 //! 字段语义、状态机、buffer 生命周期、inflight 限制完全沿用 `connection.rs`
 //! 模块文档，不再复述。
@@ -82,7 +81,7 @@ impl ConnectionState {
         let ws_cfg = WsConfig::new(cfg.host.clone(), cfg.path.clone());
         let ws = WsClient::new_client(ws_cfg)?;
 
-        let init_cap = cfg.buf_ring_buf_size as usize;
+        let init_cap = cfg.buf_ring_slot_size as usize;
         Ok(Self {
             socket,
             addr: sock_addr,
@@ -119,7 +118,10 @@ impl ConnectionState {
         }
     }
 
-    pub(crate) fn submit_connect(&mut self, proactor: &mut Proactor) -> Result<(), ConnectionError> {
+    pub(crate) fn submit_connect(
+        &mut self,
+        proactor: &mut Proactor,
+    ) -> Result<(), ConnectionError> {
         let ud = UserData::new(OpKind::Connect, u64::from(self.cfg.conn_id));
         // SAFETY: self.addr 与 self 同寿命；CQE 回来前不会被 move/drop
         unsafe {
@@ -129,7 +131,10 @@ impl ConnectionState {
         Ok(())
     }
 
-    pub(crate) fn try_submit_send(&mut self, proactor: &mut Proactor) -> Result<(), ConnectionError> {
+    pub(crate) fn try_submit_send(
+        &mut self,
+        proactor: &mut Proactor,
+    ) -> Result<(), ConnectionError> {
         if self.send_inflight {
             // 不变式：in-flight 期间不动 send_buf / send_head。任何 egress 都堆
             // 在 tls_pending_out / ws.tx_buf 里，下轮 pump 拿到 Send CQE 后再合入。
@@ -209,7 +214,10 @@ impl ConnectionState {
         self.send_head = 0;
     }
 
-    pub(crate) fn try_rearm_multishot(&mut self, proactor: &mut Proactor) -> Result<(), ConnectionError> {
+    pub(crate) fn try_rearm_multishot(
+        &mut self,
+        proactor: &mut Proactor,
+    ) -> Result<(), ConnectionError> {
         if self.multishot_armed {
             return Ok(());
         }
@@ -253,15 +261,18 @@ impl ConnectionState {
         }
     }
 
-
-    fn on_connect_cqe(&mut self, proactor: &mut Proactor, c: Completion) -> Result<(), ConnectionError> {
+    fn on_connect_cqe(
+        &mut self,
+        proactor: &mut Proactor,
+        c: Completion,
+    ) -> Result<(), ConnectionError> {
         c.to_result().map_err(ConnectionError::ConnectFailed)?;
 
         let ring = BufferRing::new(
             proactor,
             self.cfg.bgid,
             self.cfg.buf_ring_entries,
-            self.cfg.buf_ring_buf_size,
+            self.cfg.buf_ring_slot_size,
         )?;
         let bgid = ring.bgid();
         self.buf_ring = Some(ring);
@@ -281,7 +292,7 @@ impl ConnectionState {
             State::WsHandshake
         };
         if self.tls.is_none() && !self.ws_handshake_begun {
-            self.ws.begin_handshake();
+            self.ws.begin_handshake()?;
             self.ws_handshake_begun = true;
         }
         Ok(())
@@ -346,7 +357,12 @@ impl ConnectionState {
         }
 
         // Raw pointer split borrow（详见 connection.rs 模块文档同名段落）。
-        let bytes_ptr = self.buf_ring.as_ref().expect("buf_ring").buffer(bid).as_ptr();
+        let bytes_ptr = self
+            .buf_ring
+            .as_ref()
+            .expect("buf_ring")
+            .buffer(bid)
+            .as_ptr();
         // SAFETY: Proactor !Sync + 处理完才 recycle + buf_storage 是 Box<[u8]>，
         // 三条保证 bytes 视图在本函数内全程有效（详见 connection.rs 长注释）。
         let bytes: &[u8] = unsafe { std::slice::from_raw_parts(bytes_ptr, n) };
@@ -360,17 +376,20 @@ impl ConnectionState {
             if !self.plain_buf.is_empty() {
                 self.ws.feed_recv(&self.plain_buf);
             }
-            if !tls.is_handshaking() && matches!(self.state, State::TlsHandshake) && !self.ws_handshake_begun
+            if !tls.is_handshaking()
+                && matches!(self.state, State::TlsHandshake)
+                && !self.ws_handshake_begun
             {
                 // ALPN 校验：通告了 http/1.1 还不够，server 可能忽略；这里 enforce
                 tls.verify_alpn()?;
                 self.state = State::WsHandshake;
-                self.ws.begin_handshake();
+                self.ws.begin_handshake()?;
                 self.ws_handshake_begun = true;
             }
             // peer 发了 close_notify → 推 driver 到 Closing。Open 之后再发生
             // 不应该把 state 拉回 TlsHandshake；只在尚未 Closed 时推一步。
-            if tls.received_close_notify() && !matches!(self.state, State::Closed | State::Closing) {
+            if tls.received_close_notify() && !matches!(self.state, State::Closed | State::Closing)
+            {
                 self.state = State::Closing;
             }
             Ok(())

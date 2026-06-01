@@ -1,11 +1,11 @@
 //! `connection` —— Pool 内单条 conn 的公共类型
 //!
 //! [`State`] / [`ConnectionConfig`] / [`ConnectionError`] 是 [`crate::Pool`] 对外
-//! API 共用的类型。Step 3 起 `Connection` thin wrapper 已删，单 conn 路径走
-//! `Pool::new` + `Pool::connect_blocking`。
+//! API 共用的类型。公开 API 不再暴露单独的 `Connection` wrapper；单连接也通过
+//! `Pool::new` + `Pool::connect_blocking` 驱动。
 //!
 //! 实际驱动逻辑（socket / TLS / WS / buf_ring / send_buf 状态机）见
-//! [`crate::connection_state`]。
+//! `crate::connection_state`。
 
 #![allow(clippy::module_name_repetitions)]
 
@@ -17,23 +17,29 @@ use crate::proactor::{BufferRingError, ProactorConfig, ProactorError};
 use crate::tls::TlsError;
 use crate::ws::WsError;
 
-/// 单 buffer 字节数默认值。caller 可通过 [`ConnectionConfig::with_buf_ring`]
-/// 覆盖。HFT 行情常见 200B-1KB 帧，4 KiB 一格足够装下不跨 boundary；订阅 book
-/// snapshot (4-16 KiB+) 时可调大到 16/32 KiB 减少 CQE 个数。
-pub const DEFAULT_BUF_RING_BUF_SIZE: u32 = 4 * 1024;
+/// 调优点：如果 entries 太小，用户态还没 recycle，kernel 又要写数据，就可能撞 ENOBUFS；如果 buf_size 太小，大 payload 会被切成更多 CQE；如果 buf_size 太大，内存/cache 压力会上来，小行情包不一定划算
+///
+/// Provided buffer 内单 slot 字节数默认值。caller 可通过 [`ConnectionConfig::with_buf_ring`] 覆盖。
+/// HFT 高频公开行情常见 10B-1KB 帧，4 KiB 能提高单个 CQE 覆盖常见小帧的概率，
+/// 但 TCP / CQE 边界不等于 WebSocket frame 边界，parser 仍必须处理跨 CQE frame;
+/// 此处仅为根据最小 size 分布情况设置的默认值，请以实际数据 frame size 分布来调整以下参数。
+/// 影响单次 CQE 最多承载多少字节。
+pub const DEFAULT_BUF_RING_SLOT_SIZE: u32 = 4 * 1024;
 
-/// buffer ring entry 数默认值（必须 2^N）。256 × 4 KiB = 1 MiB 池子，避免
-/// 行情突发时 multishot 在 user-space recycle 前耗尽 provided buffers。
+/// buffer ring entry 数默认值（必须 2^N）。256 × 4 KiB = 1 MiB 池子（即每条 Conn 的接收池内存），
+/// 避免行情突发时 multishot 在 user-space recycle 前耗尽 provided buffers。
+/// 影响 burst 时有多少个 buffer slot 可以同时借给 kernel。
 pub const DEFAULT_BUF_RING_ENTRIES: u16 = 256;
 
 /// Driver 状态机。
 ///
 /// ```text
-///   Init ──submit_connect──▶ Connecting
+///     Init ──submit_connect──▶ Connecting
 ///     Connecting ──Connect CQE──▶ TlsHandshake (TLS) | WsHandshake (plain)
-///     TlsHandshake ──tls.is_handshaking()==false──▶ WsHandshake
+///     TlsHandshake ──TLS done + ALPN ok──▶ WsHandshake
 ///     WsHandshake ──WsClient emits HandshakeComplete──▶ Open
-///     Open ──send_close / peer Close──▶ Closing ──Close CQE──▶ Closed
+///     Open ──send_close / peer Close / protocol error──▶ Closing
+///     Closing ──peer EOF / explicit close op / fatal I/O error──▶ Closed
 /// ```
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum State {
@@ -72,35 +78,35 @@ pub enum ConnectionError {
     PeerClosed,
     #[error("CQE returned unknown OpKind: raw user_data = 0x{0:016x}")]
     UnknownOpKind(u64),
-    /// Pool 的 `conn_id` 或 `bgid` 计数器溢出。当前 v1 不回收 id，长跑 reconnect
-    /// 累计到 28-bit `conn_id` 上限 / 16-bit `bgid` 上限就报这个。修复路径：
-    /// 给 Pool 加 free-list 复用槽位。
+    /// Pool 的 `conn_id` 或 `bgid` 计数器耗尽。当前 v1 不回收 id，长跑 reconnect
+    /// 累计到 `UserData` 可编码的 conn_id 空间或 `u16` bgid 空间上限就报这个。
+    /// 修复路径：给 Pool 加 free-list 复用槽位。
     #[error("pool {0} id space exhausted; restart or implement id reuse")]
     IdSpaceExhausted(&'static str),
 }
 
-/// 构造单条 conn 的参数。`proactor` 字段透传给 [`Pool::new`](crate::Pool::new) 时
-/// 用；`conn_id` / `bgid` 由 [`Pool`](crate::Pool) 内部分配，caller 不应自己设。
+/// 构造单条 conn 的参数。`proactor` 是创建 [`Pool`](crate::Pool) 时的便利默认值；
+/// 单条 connect 实际使用 Pool 已持有的 proactor，`conn_id` / `bgid` 也由
+/// [`Pool`](crate::Pool) 内部分配，caller 不应自己设。
 #[derive(Debug, Clone)]
 pub struct ConnectionConfig {
     pub host: String,
     pub port: u16,
     pub path: String,
     pub use_tls: bool,
-    /// 透传给 [`Proactor::new`](crate::proactor::Proactor::new)。HFT 部署开 SQ_POLL +
-    /// pin kthread 到 client 线程的 SMT sibling（[`with_sq_poll`](Self::with_sq_poll)）。
+    /// 构造 [`PoolConfig`](crate::PoolConfig) 时传给 [`Proactor::new`](crate::proactor::Proactor::new)。
+    /// HFT 部署可测试 SQ_POLL + CPU pinning；把 SQ_POLL kthread 放在 client 线程的 SMT sibling 是一个候选拓扑，不是无条件最优（[`with_sq_poll`](Self::with_sq_poll)）。
     pub proactor: ProactorConfig,
     /// 本 conn 的路由 token。由 [`Pool`](crate::Pool) 在 `connect_blocking` 内分配；
     /// caller 直接构造时留默认 0 即可。低 28 位有效。
     pub conn_id: u32,
     /// 本 conn 独占的 buffer ring group id。同样由 Pool 分配。
     pub bgid: u16,
-    /// multishot recv 用的 provided buffer 单个大小（字节）。kernel 每次 RX
-    /// 最多写满这一格然后 post CQE。**取多大平衡 latency vs throughput**：
-    /// 小（4 KiB 默认）→ 单帧不跨 boundary 概率高 / 单 CQE 处理快；
-    /// 大（16-64 KiB）→ CQE 数下降 / 大 payload 不切碎，但 partial frame
-    /// remainder 处理变贵。详见 [`Self::with_buf_ring`]。
-    pub buf_ring_buf_size: u32,
+    /// multishot recv 用的 provided buffer 单个 slot 大小（字节）。kernel 每次 RX 最多写满这一格然后 post CQE。
+    /// **取多大平衡 latency vs throughput**：
+    /// 小（2 KiB 默认）→ CQE 粒度更细 / 单次 parser 输入更短 / 常见高频小帧更可能落在同一 CQE 内；
+    /// 大（> 2 KiB）→ CQE 数下降 / 大 payload 不切碎，但 partial frame remainder 处理变贵。详见 [`Self::with_buf_ring`]。
+    pub buf_ring_slot_size: u32,
     /// buffer ring entry 数。必须非零 2 的幂。`entries × buf_size` = 整池字节数；
     /// 太小会让 multishot 在 user space recycle 跟不上时频繁 ENOBUFS。
     pub buf_ring_entries: u16,
@@ -117,7 +123,7 @@ impl ConnectionConfig {
             proactor: ProactorConfig::default(),
             conn_id: 0,
             bgid: 0,
-            buf_ring_buf_size: DEFAULT_BUF_RING_BUF_SIZE,
+            buf_ring_slot_size: DEFAULT_BUF_RING_SLOT_SIZE,
             buf_ring_entries: DEFAULT_BUF_RING_ENTRIES,
         }
     }
@@ -138,39 +144,29 @@ impl ConnectionConfig {
 
     /// 覆盖 multishot recv 的 provided buffer ring 配置。
     ///
-    /// ## 经验法则
-    ///
-    /// `buf_size ≈ 20 × payload_size`（即每个 buffer 装 ~20 帧）。太小 → CQE
-    /// 数量过多，每帧 dispatch 开销吃满；太大 → cache pressure 上来，memcpy
-    /// 反超 CQE 摊销收益。实测 `benches/ws_ingress_single`：
-    ///
-    /// | payload   | 最优 buf_size | pump_binary vs tokio |
-    /// |-----------|---------------|----------------------|
-    /// | 200 B     | 4 KiB         | 1.33×                |
-    /// | 400 B     | 8 KiB         | 1.21×                |
-    /// | 800 B     | 16 KiB        | 1.01×                |
-    /// | 4 KiB    | 32 KiB+       | （TODO）             |
-    ///
-    /// HFT trades/quotes 200-400B 用默认 4 KiB 就行；订阅 L2 book delta
-    /// (400-1000B) 上 8 KiB；full snapshot (4-16 KiB) 上 32 KiB。
+    /// `slot_size ≈ 20 × payload_size`（即每个 buffer 装 ~20 帧）是调参起点，不是跨机器最优秀值
+    /// 太小 → CQE 数量过多，每帧 dispatch 开销吃满；
+    /// 太大 → cache pressure 上来，memcpy 反超 CQE 摊销收益。
+    /// 内核版本、CPU、TLS/plain、`pump`/`pump_spin`、sink 逻辑都会改变最优点：
     ///
     /// ## entries
     ///
     /// 必须非零 2 的幂。整池字节 `entries × buf_size` 决定 burst buffering 能
     /// 撑多深；默认 256 × 4 KiB = 1 MiB。内核上限 `entries ≤ 32768`。`buf_size`
-    /// 没有硬上限但 `entries × buf_size` 受限于进程 lockable memory（默认
-    /// `RLIMIT_MEMLOCK`）。
+    /// 没有硬上限但 `entries × slot_size` 受限于进程 lockable memory（默认 `RLIMIT_MEMLOCK`）。
     ///
     /// # Panics
     ///
-    /// debug build 下 `entries == 0 || !entries.is_power_of_two()` 立刻 panic；
-    /// release build 下 [`Pool::connect_blocking`](crate::Pool::connect_blocking)
-    /// 时 [`BufferRing::new`] 会返 Err。
+    /// debug build 下 `slot_size == 0 || entries == 0 || !entries.is_power_of_two()` 立刻 panic；
+    /// release build 下 [`Pool::connect_blocking`](crate::Pool::connect_blocking) 时 [`crate::proactor::BufferRing::new`] 会返 Err。
     #[must_use]
-    pub const fn with_buf_ring(mut self, buf_size: u32, entries: u16) -> Self {
-        debug_assert!(buf_size > 0, "buf_size must be > 0");
-        debug_assert!(entries > 0 && entries.is_power_of_two(), "entries must be non-zero power of 2");
-        self.buf_ring_buf_size = buf_size;
+    pub const fn with_buf_ring(mut self, slot_size: u32, entries: u16) -> Self {
+        debug_assert!(slot_size > 0, "slot_size must be > 0");
+        debug_assert!(
+            entries > 0 && entries.is_power_of_two(),
+            "entries must be non-zero power of 2"
+        );
+        self.buf_ring_slot_size = slot_size;
         self.buf_ring_entries = entries;
         self
     }

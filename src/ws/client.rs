@@ -10,8 +10,8 @@
 //! 3. caller 把 tx_buf send 出去，读 socket 把 bytes feed 回来
 //! 4. `poll_event()` 出来第一个事件是 `HandshakeComplete`
 //! 5. 之后 `poll_event()` 出 Text / Binary / Ping / Pong / Close
-//! 6. `send_text/binary/ping/close()` 主动发
-//! 7. 收到 / 主动发出 Close 后状态 → `Closing` → `Closed`
+//! 6. `send_text/binary/ping/pong/close()` 主动发
+//! 7. 主动发 Close 后状态 → `Closing`；收到合法 Close 后 queue echo 并进入 `Closed`
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -25,7 +25,7 @@
 use super::close::{
     CloseCode, CloseError, encode_close_payload, is_valid_endpoint_sent, parse_close_payload,
 };
-use super::frame::{FrameError, FrameHeader, MAX_HEADER_LEN, OpCode, encode_header, parse_header};
+use super::frame::{FrameError, FrameHeader, MAX_HEADER_LEN, OpCode, encode_header};
 use super::handshake::{
     HandshakeError, UpgradeRequest, encode_upgrade_request, generate_key, verify_upgrade_response,
 };
@@ -74,7 +74,7 @@ pub enum ConnState {
     Open,
     /// close 已发或已收，等 peer close
     Closing,
-    /// TCP 可以关了（或已关）
+    /// WS 层不再接收新事件；caller 仍应先 flush `pending_tx()` 中已排队的 close frame
     Closed,
 }
 
@@ -87,12 +87,21 @@ pub enum Event<'a> {
     Text(&'a str),
     /// 完整 binary 消息
     Binary(&'a [u8]),
-    /// 收到 Ping（payload 可见，client 已自动 pong）
+    /// 收到 Ping（payload 可见；若 `auto_pong` 开启，Pong 已排入 `pending_tx()`）
     Ping(&'a [u8]),
     /// 收到 Pong
     Pong(&'a [u8]),
     /// 收到 Close
     Close { code: u16, reason: &'a str },
+}
+
+/// 只包含业务 data message 的轻量事件。
+#[derive(Debug)]
+pub enum DataEvent<'a> {
+    /// 完整 text 消息（UTF-8 已校验）
+    Text(&'a str),
+    /// 完整 binary 消息
+    Binary(&'a [u8]),
 }
 
 #[derive(Debug, Error)]
@@ -107,6 +116,8 @@ pub enum WsError {
     Close(#[from] CloseError),
     #[error("protocol error: {0}")]
     Protocol(&'static str),
+    #[error("operation not allowed in websocket state {0:?}")]
+    InvalidState(ConnState),
     #[error("text frame had invalid UTF-8")]
     Utf8Invalid,
     #[error("assembled message exceeded max_message_size")]
@@ -130,8 +141,7 @@ pub struct WsClient {
     state: ConnState,
     parser: FrameParser,
     /// raw bytes from socket / TLS layer; drained as parser consumes。
-    /// 改用 [`CursorBuf`] 后，partial-frame consume 是 O(1) head 自增，
-    /// 早期 `Vec::drain(..consumed)` 是 O(n) memmove，hot path per-frame 损耗。
+    /// partial-frame consume 是 O(1) head 自增，
     recv_buf: CursorBuf,
     /// assembled data message payload。整体 clear 不 drain，仍用 `Vec<u8>`。
     msg_buf: Vec<u8>,
@@ -152,6 +162,8 @@ pub struct WsClient {
     config: WsConfig,
     /// handshake 用的 client key（base64）
     client_key: String,
+    /// 防止 caller 重复 append GET Upgrade 请求。
+    handshake_started: bool,
     /// 上一次 poll_event 已经 emit 过的 kind，下次进 poll 时按此清缓存
     last_emitted: Option<EmitKind>,
     /// CSPRNG mask-key pool。RFC §10.3 要求 mask key "unpredictable"，所以不能
@@ -167,8 +179,8 @@ pub struct WsClient {
     mask_rng: ring::rand::SystemRandom,
 }
 
-/// 一次 refill 装 64 个 mask key（256 字节）。对应 ~64 帧的 mask 预算 —— 即使
-/// 极端高频也只是每 ms 一次 SystemRandom 调用。256 字节 stack array，无堆分配。
+/// 一次 refill 装 64 个 mask key（256 字节）。refill 频率取决于 outbound frame
+/// 数量：每 64 帧最多调用一次 SystemRandom。数组内联在 `WsClient` 里，无堆分配。
 const MASK_POOL_BYTES: usize = 256;
 
 impl WsClient {
@@ -198,6 +210,7 @@ impl WsClient {
             tx_head: 0,
             config,
             client_key: key,
+            handshake_started: false,
             last_emitted: None,
             mask_pool,
             mask_pool_cursor: 0,
@@ -206,11 +219,25 @@ impl WsClient {
     }
 
     /// 编码 GET Upgrade 请求字节到 tx_buf。lifecycle 步 2。
-    pub fn begin_handshake(&mut self) {
+    ///
+    /// 只能在新建 client 的 `Connecting` 初始阶段调用一次；重复调用返回
+    /// `WsError::Protocol`，避免 append 第二份 GET Upgrade 请求。
+    pub fn begin_handshake(&mut self) -> Result<(), WsError> {
+        if self.state != ConnState::Connecting {
+            return Err(WsError::InvalidState(self.state));
+        }
+        if self.handshake_started {
+            return Err(WsError::Protocol("handshake already begun"));
+        }
         // 一般 handshake 是开局第一次 push，tx_head==0；这里 compact 是防御性
         // （如果 caller 复用同一 WsClient 实例做重连的话）。
         self.compact_tx_if_needed(256);
-        let subprotos_refs: Vec<&str> = self.config.subprotocols.iter().map(String::as_str).collect();
+        let subprotos_refs: Vec<&str> = self
+            .config
+            .subprotocols
+            .iter()
+            .map(String::as_str)
+            .collect();
         let req = UpgradeRequest {
             host: &self.config.host,
             path: &self.config.path,
@@ -219,6 +246,8 @@ impl WsClient {
             origin: self.config.origin.as_deref(),
         };
         encode_upgrade_request(&mut self.tx_buf, &req);
+        self.handshake_started = true;
+        Ok(())
     }
 
     /// 喂明文字节（TLS 解密后或裸 TCP）
@@ -244,148 +273,115 @@ impl WsClient {
                 Ok(AdvanceResult::Progressed) => continue,
                 Ok(AdvanceResult::NeedMore) => return None,
                 Err(e) => {
-                    self.state = ConnState::Closed;
+                    if self.state != ConnState::Closing {
+                        self.state = ConnState::Closed;
+                    }
                     return Some(Err(e));
                 }
             }
         }
     }
 
-    /// **Inbound fast path** —— 给"server 几乎只发 FIN-Binary 帧"的 workload
-    /// 用（典型订阅 client 行情流）。直接走 [`parse_header`] + 调 `sink(payload)`，
-    /// 跳过：fragmentation accumulator、`msg_buf` memcpy、control auto-pong、
-    /// `Event` enum dispatch、`Action`/`AdvanceResult` 状态机。
+    /// Drain WS events but only surface Text/Binary data messages to `sink`.
     ///
-    /// **Strict mode**：任何非 FIN-Binary 帧（Text / Continuation / 任何 Control
-    /// 含 Ping / Pong / Close）都判 protocol error，queue 一个 Close 然后返
-    /// `Err`。如果业务上 server 真有可能发这些，**不要**用 fast path，走通用
-    /// [`Self::poll_event`]。
+    /// 这不是 binary-only shortcut：它完整走 [`poll_event`](Self::poll_event)，
+    /// 因此 Ping/Pong/Close、fragmentation、UTF-8 校验和 auto-pong 语义都与通用
+    /// 路径一致。适合交易所 feed：Text JSON 和 Binary SBE 都会被分发，control
+    /// frame 由 WS 层处理。
     ///
-    /// 服务端发出的帧 RFC §5.1 规定 **不带 mask**；带了就 protocol error。
-    ///
-    /// 与 [`poll_event`](Self::poll_event) 不互斥 —— 同一 `WsClient` 上交替调用
-    /// 都安全（recv_buf 是 cursor，状态机不冲突）。生产典型用法：handshake 阶段
-    /// 用 `poll_event` 等 `HandshakeComplete`，进入 Open 后切到 `drain_binary_frames`。
-    ///
-    /// 返回这一轮从 `recv_buf` 消费掉的字节数（含 header + payload）。
-    pub fn drain_binary_frames<F>(&mut self, mut sink: F) -> Result<usize, WsError>
+    /// 返回这一轮处理掉的 WS event 数量（包含被内部消费的 Ping/Pong/Close）。
+    pub fn drain_data_events<F>(&mut self, mut sink: F) -> Result<usize, WsError>
     where
-        F: FnMut(&[u8]),
+        F: FnMut(DataEvent<'_>),
     {
-        if self.state != ConnState::Open {
-            return Ok(0);
-        }
-
-        let mut total_consumed = 0_usize;
-        loop {
-            // 1) 解 header —— 短暂 immutable borrow，到 match 结束就 drop
-            let (hdr, header_size) = match parse_header(self.recv_buf.as_slice()) {
-                Ok(Some(x)) => x,
-                Ok(None) => break,
-                Err(e) => {
-                    self.queue_close(CloseCode::ProtocolError.as_u16(), "frame parse error");
-                    return Err(WsError::Frame(e));
-                }
-            };
-
-            // 2) Fast-path 守门
-            self.fast_path_check(&hdr)?;
-
-            let payload_len = hdr.payload_len as usize;
-            let frame_total = header_size + payload_len;
-            if self.recv_buf.as_slice().len() < frame_total {
-                break; // 这一帧字节没到齐，等下一轮
+        let mut events = 0_usize;
+        while let Some(res) = self.poll_event() {
+            let ev = res?;
+            events += 1;
+            match ev {
+                Event::Text(s) => sink(DataEvent::Text(s)),
+                Event::Binary(bytes) => sink(DataEvent::Binary(bytes)),
+                Event::HandshakeComplete
+                | Event::Ping(_)
+                | Event::Pong(_)
+                | Event::Close { .. } => {}
             }
-
-            // 3) sink 拿到 payload slice，仍在 immutable borrow 期内 ——
-            //    return 之前不能 consume
-            sink(&self.recv_buf.as_slice()[header_size..frame_total]);
-
-            // 4) sink 返回后 borrow 释放，O(1) cursor 前进
-            self.recv_buf.consume(frame_total);
-            total_consumed += frame_total;
         }
-        Ok(total_consumed)
+        Ok(events)
     }
 
-    /// [`drain_binary_frames`](Self::drain_binary_frames) 的 fast-path 守门：
-    /// FIN + Binary + unmasked + payload ≤ max。任何一条不过就 queue_close + Err。
-    fn fast_path_check(&mut self, hdr: &FrameHeader) -> Result<(), WsError> {
-        if !hdr.fin {
-            self.queue_close(CloseCode::ProtocolError.as_u16(), "fast-path: fragmented");
-            return Err(WsError::Protocol("fast-path: fragmented frame"));
+    /// 主动发 Text。`payload` 必须是合法 UTF-8。仅在 `ConnState::Open` 生效。
+    pub fn send_text(&mut self, payload: &[u8]) -> Result<(), WsError> {
+        if std::str::from_utf8(payload).is_err() {
+            return Err(WsError::Utf8Invalid);
         }
-        if hdr.opcode != OpCode::Binary {
-            self.queue_close(CloseCode::ProtocolError.as_u16(), "fast-path: non-binary");
-            return Err(WsError::Protocol("fast-path: non-Binary opcode"));
-        }
-        if hdr.mask.is_some() {
-            self.queue_close(
-                CloseCode::ProtocolError.as_u16(),
-                "server sent masked frame",
-            );
-            return Err(WsError::Frame(FrameError::ServerSentMaskedFrame));
-        }
-        if hdr.payload_len > self.config.max_frame_payload {
-            self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
-            return Err(WsError::MessageTooLarge);
-        }
+        self.assert_can_send_data()?;
+        self.write_frame(true, OpCode::Text, payload);
         Ok(())
     }
 
-    /// 主动发 Text。`payload` 必须是合法 UTF-8（debug 模式断言）。仅在
-    /// `ConnState::Open` 生效；其它状态 silently no-op（debug 模式 assert）。
-    pub fn send_text(&mut self, payload: &[u8]) {
-        debug_assert!(std::str::from_utf8(payload).is_ok());
-        if !self.assert_can_send_data() {
-            return;
-        }
-        self.write_frame(true, OpCode::Text, payload);
-    }
-
-    pub fn send_binary(&mut self, payload: &[u8]) {
-        if !self.assert_can_send_data() {
-            return;
-        }
+    pub fn send_binary(&mut self, payload: &[u8]) -> Result<(), WsError> {
+        self.assert_can_send_data()?;
         self.write_frame(true, OpCode::Binary, payload);
+        Ok(())
     }
 
     /// 主动 Ping（payload ≤ 125 字节）
-    pub fn send_ping(&mut self, payload: &[u8]) {
-        debug_assert!(payload.len() <= 125);
-        if !self.assert_can_send_data() {
-            return;
+    pub fn send_ping(&mut self, payload: &[u8]) -> Result<(), WsError> {
+        if payload.len() > 125 {
+            return Err(WsError::Protocol("ping payload > 125 bytes"));
         }
+        self.assert_can_send_data()?;
         self.write_frame(true, OpCode::Ping, payload);
+        Ok(())
     }
 
-    /// 发 Close（code 必须 endpoint-sendable，参见 RFC §7.4.2）。状态机进 Closing。
+    /// 主动 Pong（payload ≤ 125 字节）。
+    ///
+    /// 收到 Ping 时默认会自动 queue Pong；这个 API 用于手动响应 Ping（例如关闭
+    /// `auto_pong` 后由业务接管）或发送交易所允许的 unsolicited Pong。
+    pub fn send_pong(&mut self, payload: &[u8]) -> Result<(), WsError> {
+        if payload.len() > 125 {
+            return Err(WsError::Protocol("pong payload > 125 bytes"));
+        }
+        self.assert_can_send_data()?;
+        self.write_frame(true, OpCode::Pong, payload);
+        Ok(())
+    }
+
+    /// 发 Close（code 必须 endpoint-sendable，参见 RFC §7.4.2）。仅 `Open` 状态会
+    /// queue Close frame 并进入 `Closing`；`Connecting` 返回 `InvalidState`。
     /// 重复调用幂等：已 Closing / Closed 时 no-op，避免发第二个 Close frame
     /// （RFC §5.5.1：每端最多一个 Close）。
-    pub fn send_close(&mut self, code: u16, reason: &str) {
-        debug_assert!(is_valid_endpoint_sent(code));
-        debug_assert!(reason.len() <= 123);
+    pub fn send_close(&mut self, code: u16, reason: &str) -> Result<(), WsError> {
         if matches!(self.state, ConnState::Closing | ConnState::Closed) {
-            return;
+            return Ok(());
+        }
+        if self.state != ConnState::Open {
+            return Err(WsError::InvalidState(self.state));
+        }
+        if !is_valid_endpoint_sent(code) {
+            return Err(WsError::Close(CloseError::InvalidCode(code)));
+        }
+        if reason.len() > 123 {
+            return Err(WsError::Protocol("close reason > 123 bytes"));
         }
         let mut payload = [0_u8; 125];
         let n = encode_close_payload(&mut payload, code, reason);
         self.write_frame(true, OpCode::Close, &payload[..n]);
-        if self.state == ConnState::Open {
-            self.state = ConnState::Closing;
-        }
+        self.state = ConnState::Closing;
+        Ok(())
     }
 
-    /// 数据帧 / Ping 的发送前置检查。仅 Open 允许；其它状态 debug-panic / release no-op。
+    /// 数据帧 / Ping / Pong 的发送前置检查。仅 Open 允许。
     /// 早期版本在 Connecting 状态把 data frame 提前塞进 `tx_buf` 会把 GET upgrade
     /// 请求和数据帧拼到一起（畸形 wire format），release 路径下静默错路。
-    fn assert_can_send_data(&self) -> bool {
-        debug_assert!(
-            self.state == ConnState::Open,
-            "send_* called while ws state = {:?}; only Open is allowed",
-            self.state
-        );
-        self.state == ConnState::Open
+    fn assert_can_send_data(&self) -> Result<(), WsError> {
+        if self.state == ConnState::Open {
+            Ok(())
+        } else {
+            Err(WsError::InvalidState(self.state))
+        }
     }
 
     /// 待发字节（caller 写到 socket）。返回的 slice 总是从 `tx_head` 开始。
@@ -395,8 +391,9 @@ impl WsClient {
         &self.tx_buf[self.tx_head..]
     }
 
-    /// 通知已发出 N 字节。O(1) cursor 自增；head 追上 len 时整体 reset（仍 O(1)）。
-    /// 早期实现是 `Vec::drain(..n)`，partial-send 时是 O(n) memmove。
+    /// 通知已发出 N 字节。caller 必须保证 `n <= pending_tx().len()`；O(1) cursor
+    /// 自增，head 追上 len 时整体 reset（仍 O(1)）。早期实现是
+    /// `Vec::drain(..n)`，partial-send 时是 O(n) memmove。
     pub fn ack_tx(&mut self, n: usize) {
         debug_assert!(n <= self.pending_tx().len());
         self.tx_head += n;
@@ -440,8 +437,12 @@ impl WsClient {
         let parsed = parse_response(self.recv_buf.as_slice())?;
         let (status, end) = match parsed {
             Some((r, end)) => {
-                let offered: Vec<&str> =
-                    self.config.subprotocols.iter().map(String::as_str).collect();
+                let offered: Vec<&str> = self
+                    .config
+                    .subprotocols
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
                 verify_upgrade_response(&r, &self.client_key, &offered)?;
                 (r.status, end)
             }
@@ -455,7 +456,13 @@ impl WsClient {
 
     fn advance_frame(&mut self) -> Result<AdvanceResult, WsError> {
         let (consumed, action) = {
-            let outcome = self.parser.feed_one(self.recv_buf.as_slice())?;
+            let outcome = match self.parser.feed_one(self.recv_buf.as_slice()) {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    self.queue_close(CloseCode::ProtocolError.as_u16(), "frame parse error");
+                    return Err(WsError::Frame(e));
+                }
+            };
             match outcome {
                 FeedOutcome::NeedMore { consumed } => (consumed, Action::NeedMore),
                 FeedOutcome::Event {
@@ -517,7 +524,10 @@ impl WsClient {
         match h.opcode {
             OpCode::Continuation => {
                 if self.msg_opcode.is_none() {
-                    self.queue_close(CloseCode::ProtocolError.as_u16(), "continuation without start");
+                    self.queue_close(
+                        CloseCode::ProtocolError.as_u16(),
+                        "continuation without start",
+                    );
                     return Err(WsError::Protocol("continuation without start"));
                 }
             }
@@ -612,7 +622,7 @@ impl WsClient {
             Err(e) => {
                 // peer 发了违法 close payload — 我们回 1002
                 self.queue_close(CloseCode::ProtocolError.as_u16(), "bad close payload");
-                self.state = ConnState::Closed;
+                self.state = ConnState::Closing;
                 return Err(e);
             }
         };
@@ -749,7 +759,27 @@ mod tests {
     /// 模拟 server 发给 client 的（unmasked）单帧 text
     fn server_text(payload: &[u8]) -> Vec<u8> {
         let mut buf = vec![0_u8; MAX_HEADER_LEN];
-        let n = super::super::frame::encode_header(&mut buf, true, OpCode::Text, None, payload.len() as u64);
+        let n = super::super::frame::encode_header(
+            &mut buf,
+            true,
+            OpCode::Text,
+            None,
+            payload.len() as u64,
+        );
+        buf.truncate(n);
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    fn server_binary(payload: &[u8]) -> Vec<u8> {
+        let mut buf = vec![0_u8; MAX_HEADER_LEN];
+        let n = super::super::frame::encode_header(
+            &mut buf,
+            true,
+            OpCode::Binary,
+            None,
+            payload.len() as u64,
+        );
         buf.truncate(n);
         buf.extend_from_slice(payload);
         buf
@@ -762,6 +792,15 @@ mod tests {
         let hn = super::super::frame::encode_header(&mut buf, true, OpCode::Close, None, n as u64);
         buf.truncate(hn);
         buf.extend_from_slice(&payload[..n]);
+        buf
+    }
+
+    fn server_control(opcode: OpCode, payload: &[u8]) -> Vec<u8> {
+        let mut buf = vec![0_u8; MAX_HEADER_LEN];
+        let hn =
+            super::super::frame::encode_header(&mut buf, true, opcode, None, payload.len() as u64);
+        buf.truncate(hn);
+        buf.extend_from_slice(payload);
         buf
     }
 
@@ -779,7 +818,7 @@ mod tests {
     #[test]
     fn handshake_then_text_then_close() {
         let mut c = mk_client();
-        c.begin_handshake();
+        c.begin_handshake().unwrap();
         assert!(!c.pending_tx().is_empty());
         // ack everything
         let n = c.pending_tx().len();
@@ -816,9 +855,20 @@ mod tests {
     }
 
     #[test]
+    fn begin_handshake_rejects_duplicate_call() {
+        let mut c = mk_client();
+        c.begin_handshake().unwrap();
+        let pending_len = c.pending_tx().len();
+
+        let err = c.begin_handshake().unwrap_err();
+        assert!(matches!(err, WsError::Protocol("handshake already begun")));
+        assert_eq!(c.pending_tx().len(), pending_len);
+    }
+
+    #[test]
     fn ping_triggers_auto_pong() {
         let mut c = mk_client();
-        c.begin_handshake();
+        c.begin_handshake().unwrap();
         c.ack_tx(c.pending_tx().len());
         c.feed_recv(&fake_101_response(&c.client_key));
         c.poll_event(); // consume HandshakeComplete
@@ -843,15 +893,52 @@ mod tests {
     }
 
     #[test]
+    fn drain_data_events_handles_control_and_dispatches_text_binary() {
+        let mut c = mk_client();
+        c.begin_handshake().unwrap();
+        c.ack_tx(c.pending_tx().len());
+        c.feed_recv(&fake_101_response(&c.client_key));
+        c.poll_event(); // consume HandshakeComplete
+        c.ack_tx(c.pending_tx().len());
+
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&server_text(b"{\"op\":\"subscribed\"}"));
+        wire.extend_from_slice(&server_control(OpCode::Ping, b"hb"));
+        wire.extend_from_slice(&server_binary(b"\x01\x02\x03\x04"));
+        c.feed_recv(&wire);
+
+        let mut data = Vec::new();
+        let events = c
+            .drain_data_events(|ev| match ev {
+                DataEvent::Text(s) => data.push(format!("text:{s}")),
+                DataEvent::Binary(bytes) => data.push(format!("binary:{}", bytes.len())),
+            })
+            .unwrap();
+
+        assert_eq!(events, 3);
+        assert_eq!(
+            data,
+            vec![
+                "text:{\"op\":\"subscribed\"}".to_owned(),
+                "binary:4".to_owned()
+            ]
+        );
+        assert!(
+            !c.pending_tx().is_empty(),
+            "Ping should have queued an auto-pong"
+        );
+    }
+
+    #[test]
     fn outgoing_text_is_masked() {
         let mut c = mk_client();
         // 必须先把 ws 推到 Open，才允许 send_text（state guard）
-        c.begin_handshake();
+        c.begin_handshake().unwrap();
         c.ack_tx(c.pending_tx().len());
         c.feed_recv(&fake_101_response(&c.client_key));
         c.poll_event();
         assert_eq!(c.state(), ConnState::Open);
-        c.send_text(b"hello");
+        c.send_text(b"hello").unwrap();
         let tx = c.pending_tx();
         // byte0 = FIN | Text = 0x81
         assert_eq!(tx[0], 0x81);
@@ -867,9 +954,104 @@ mod tests {
     }
 
     #[test]
+    fn outgoing_pong_is_masked() {
+        let mut c = mk_client();
+        c.begin_handshake().unwrap();
+        c.ack_tx(c.pending_tx().len());
+        c.feed_recv(&fake_101_response(&c.client_key));
+        c.poll_event();
+        assert_eq!(c.state(), ConnState::Open);
+
+        c.send_pong(b"pong").unwrap();
+        let tx = c.pending_tx();
+        // byte0 = FIN | Pong = 0x8A
+        assert_eq!(tx[0], 0x8A);
+        // byte1 high bit = MASK = 0x80, len = 4 → 0x84
+        assert_eq!(tx[1], 0x84);
+        assert_eq!(tx.len(), 10);
+
+        let key = [tx[2], tx[3], tx[4], tx[5]];
+        let mut payload: Vec<u8> = tx[6..].to_vec();
+        super::super::mask::mask_inplace(&mut payload, key);
+        assert_eq!(&payload, b"pong");
+    }
+
+    #[test]
+    fn send_rejects_invalid_payloads_in_release_path() {
+        let mut c = mk_client();
+        assert!(matches!(
+            c.send_text(b"hello").unwrap_err(),
+            WsError::InvalidState(ConnState::Connecting)
+        ));
+        assert!(matches!(
+            c.send_pong(b"pong").unwrap_err(),
+            WsError::InvalidState(ConnState::Connecting)
+        ));
+
+        c.begin_handshake().unwrap();
+        c.ack_tx(c.pending_tx().len());
+        c.feed_recv(&fake_101_response(&c.client_key));
+        c.poll_event();
+        assert_eq!(c.state(), ConnState::Open);
+
+        assert!(matches!(c.send_text(&[0xFF]), Err(WsError::Utf8Invalid)));
+        assert!(matches!(
+            c.send_ping(&[0_u8; 126]),
+            Err(WsError::Protocol("ping payload > 125 bytes"))
+        ));
+        assert!(matches!(
+            c.send_pong(&[0_u8; 126]),
+            Err(WsError::Protocol("pong payload > 125 bytes"))
+        ));
+        assert!(matches!(
+            c.send_close(1006, ""),
+            Err(WsError::Close(CloseError::InvalidCode(1006)))
+        ));
+        assert!(matches!(
+            c.send_close(1000, "x".repeat(124).as_str()),
+            Err(WsError::Protocol("close reason > 123 bytes"))
+        ));
+    }
+
+    #[test]
+    fn frame_parse_error_queues_close_before_error() {
+        let mut c = mk_client();
+        c.begin_handshake().unwrap();
+        c.ack_tx(c.pending_tx().len());
+        c.feed_recv(&fake_101_response(&c.client_key));
+        c.poll_event();
+
+        // Server frames must not be masked.
+        c.feed_recv(b"\x81\x85\x12\x34\x56\x78Hello");
+        match c.poll_event() {
+            Some(Err(WsError::Frame(FrameError::ServerSentMaskedFrame))) => {}
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(c.state(), ConnState::Closing);
+        assert!(!c.pending_tx().is_empty());
+    }
+
+    #[test]
+    fn invalid_close_payload_queues_protocol_close() {
+        let mut c = mk_client();
+        c.begin_handshake().unwrap();
+        c.ack_tx(c.pending_tx().len());
+        c.feed_recv(&fake_101_response(&c.client_key));
+        c.poll_event();
+
+        c.feed_recv(&server_control(OpCode::Close, &[0x03]));
+        match c.poll_event() {
+            Some(Err(WsError::Close(CloseError::OneByte))) => {}
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(c.state(), ConnState::Closing);
+        assert!(!c.pending_tx().is_empty());
+    }
+
+    #[test]
     fn fragmented_text_message_assembled() {
         let mut c = mk_client();
-        c.begin_handshake();
+        c.begin_handshake().unwrap();
         c.ack_tx(c.pending_tx().len());
         c.feed_recv(&fake_101_response(&c.client_key));
         c.poll_event();
@@ -900,7 +1082,7 @@ mod tests {
     #[test]
     fn bad_handshake_status_rejected() {
         let mut c = mk_client();
-        c.begin_handshake();
+        c.begin_handshake().unwrap();
         c.feed_recv(b"HTTP/1.1 400 Bad Request\r\n\r\n");
         match c.poll_event() {
             Some(Err(WsError::Handshake(HandshakeError::BadStatus(400)))) => {}

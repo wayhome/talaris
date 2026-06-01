@@ -39,8 +39,8 @@ libc         = "0.2"
 io-uring      = "0.7"
 core_affinity = "0.8"
 
+[dev-dependencies]
 # example / bench 用：per-handle latency 测量 + tokio 对照组
-[target.'cfg(target_os = "linux")'.dev-dependencies]
 hdrhistogram = "7"
 # benchmark 对照组。features 砍到只够单线程 TCP echo —— 不让 tokio 拉一堆
 # 额外组件（fs / signal / process / sync 等）进 bench 二进制；这样比较更接近

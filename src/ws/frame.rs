@@ -91,6 +91,8 @@ pub enum FrameError {
     ControlFrameTooLarge,
     #[error("payload length 64-bit MSB set (RFC §5.2)")]
     PayloadTooLarge,
+    #[error("payload length used a non-minimal encoding (RFC §5.2)")]
+    NonMinimalPayloadLength,
     #[error("server sent masked frame (RFC §5.1 violation)")]
     ServerSentMaskedFrame,
 }
@@ -126,17 +128,26 @@ pub fn parse_header(buf: &[u8]) -> Result<Option<(FrameHeader, usize)>, FrameErr
             if buf.len() < 4 {
                 return Ok(None);
             }
-            (u64::from(u16::from_be_bytes([buf[2], buf[3]])), 2)
+            let val = u16::from_be_bytes([buf[2], buf[3]]);
+            if val < 126 {
+                return Err(FrameError::NonMinimalPayloadLength);
+            }
+            (u64::from(val), 2)
         }
         127 => {
             if buf.len() < 10 {
                 return Ok(None);
             }
-            let bytes = [buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9]];
+            let bytes = [
+                buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
+            ];
             let val = u64::from_be_bytes(bytes);
             // RFC §5.2: 64-bit length MSB must be 0
             if val & 0x8000_0000_0000_0000 != 0 {
                 return Err(FrameError::PayloadTooLarge);
+            }
+            if val <= 0xFFFF {
+                return Err(FrameError::NonMinimalPayloadLength);
             }
             (val, 8)
         }
@@ -312,6 +323,22 @@ mod tests {
         let buf = [0x82_u8, 0x7F, 0x80, 0, 0, 0, 0, 0, 0, 0];
         let err = parse_header(&buf).unwrap_err();
         assert_eq!(err, FrameError::PayloadTooLarge);
+    }
+
+    #[test]
+    fn non_minimal_16bit_len_rejected() {
+        // len 125 must be encoded in the 7-bit length field, not 16-bit extended.
+        let buf = [0x82_u8, 0x7E, 0x00, 0x7D];
+        let err = parse_header(&buf).unwrap_err();
+        assert_eq!(err, FrameError::NonMinimalPayloadLength);
+    }
+
+    #[test]
+    fn non_minimal_64bit_len_rejected() {
+        // len 65535 must be encoded in the 16-bit length field, not 64-bit extended.
+        let buf = [0x82_u8, 0x7F, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF];
+        let err = parse_header(&buf).unwrap_err();
+        assert_eq!(err, FrameError::NonMinimalPayloadLength);
     }
 
     #[test]

@@ -32,7 +32,7 @@
 //!
 //! ## 平台
 //!
-//! 真正的实现只在 `cfg(target_os = "linux")` 下编译。macOS 走 [`stub`]，
+//! 真正的实现只在 `cfg(target_os = "linux")` 下编译。macOS 走 `stub`，
 //! API 形态一致但调用即 `unimplemented!()`，让本地 `cargo check` 仍过。
 
 #[cfg(target_os = "linux")]
@@ -62,8 +62,8 @@ pub use uring::{Proactor, ProactorConfig, ProactorError};
 
 #[cfg(not(target_os = "linux"))]
 pub use stub::{
-    AffinityError, BufferRing, BufferRingError, Completion, Domain, OpKind, Proactor, ProactorConfig,
-    ProactorError, SockAddr, SqeFlags, TcpSocket, UserData,
+    AffinityError, BufferRing, BufferRingError, Completion, Domain, OpKind, Proactor,
+    ProactorConfig, ProactorError, SockAddr, SqeFlags, TcpSocket, UserData,
 };
 
 #[cfg(not(target_os = "linux"))]

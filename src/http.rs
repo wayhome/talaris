@@ -24,6 +24,8 @@ pub const MAX_RESPONSE_HEADER_COUNT: usize = 64;
 pub enum HttpError {
     #[error("malformed status line")]
     BadStatusLine,
+    #[error("unsupported HTTP response version")]
+    UnsupportedVersion,
     #[error("malformed header line")]
     BadHeader,
     #[error("response not utf-8")]
@@ -48,6 +50,7 @@ pub struct Http1Builder<'a> {
 /// 解析后的 response 视图（借用输入 buffer）
 #[derive(Debug)]
 pub struct Http1Response<'a> {
+    pub version: &'a str,
     pub status: u16,
     pub reason: &'a str,
     pub headers: Vec<(&'a str, &'a str)>,
@@ -59,9 +62,14 @@ impl<'a> Http1Response<'a> {
     /// 大小写不敏感查 header
     #[must_use]
     pub fn header(&self, name: &str) -> Option<&'a str> {
+        self.header_values(name).next()
+    }
+
+    /// 大小写不敏感遍历所有同名 header。
+    pub fn header_values<'b>(&'b self, name: &'b str) -> impl Iterator<Item = &'a str> + 'b {
         self.headers
             .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .filter(move |(n, _)| n.eq_ignore_ascii_case(name))
             .map(|(_, v)| *v)
     }
 }
@@ -120,7 +128,7 @@ pub fn parse_response(input: &[u8]) -> Result<Option<(Http1Response<'_>, usize)>
     let mut lines = s.split("\r\n");
 
     let status_line = lines.next().ok_or(HttpError::BadStatusLine)?;
-    let (status, reason) = parse_status_line(status_line)?;
+    let (version, status, reason) = parse_status_line(status_line)?;
 
     let mut headers: Vec<(&str, &str)> = Vec::with_capacity(8);
     for line in lines {
@@ -153,6 +161,7 @@ pub fn parse_response(input: &[u8]) -> Result<Option<(Http1Response<'_>, usize)>
     let body_start = header_end + 4; // past \r\n\r\n
     Ok(Some((
         Http1Response {
+            version,
             status,
             reason,
             headers,
@@ -166,14 +175,17 @@ fn find_double_crlf(input: &[u8]) -> Option<usize> {
     input.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-fn parse_status_line(line: &str) -> Result<(u16, &str), HttpError> {
+fn parse_status_line(line: &str) -> Result<(&str, u16, &str), HttpError> {
     // HTTP/1.1 NNN Reason Phrase
     let mut parts = line.splitn(3, ' ');
-    let _version = parts.next().ok_or(HttpError::BadStatusLine)?;
+    let version = parts.next().ok_or(HttpError::BadStatusLine)?;
+    if version != "HTTP/1.1" {
+        return Err(HttpError::UnsupportedVersion);
+    }
     let code_str = parts.next().ok_or(HttpError::BadStatusLine)?;
     let reason = parts.next().unwrap_or("");
     let code: u16 = code_str.parse().map_err(|_| HttpError::BadStatusLine)?;
-    Ok((code, reason))
+    Ok((version, code, reason))
 }
 
 #[cfg(test)]
@@ -211,6 +223,7 @@ mod tests {
             Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\
             \r\n";
         let (r, end) = parse_response(resp).unwrap().unwrap();
+        assert_eq!(r.version, "HTTP/1.1");
         assert_eq!(r.status, 101);
         assert_eq!(r.reason, "Switching Protocols");
         assert_eq!(r.header("upgrade"), Some("websocket"));
@@ -233,6 +246,29 @@ mod tests {
     fn malformed_status_rejected() {
         let resp = b"BOGUS\r\n\r\n";
         assert!(parse_response(resp).is_err());
+    }
+
+    #[test]
+    fn unsupported_status_version_rejected() {
+        let resp = b"HTTP/1.0 101 Switching Protocols\r\n\r\n";
+        let err = parse_response(resp).unwrap_err();
+        assert!(matches!(err, HttpError::UnsupportedVersion));
+
+        let resp = b"BOGUS 101 Switching Protocols\r\n\r\n";
+        let err = parse_response(resp).unwrap_err();
+        assert!(matches!(err, HttpError::UnsupportedVersion));
+    }
+
+    #[test]
+    fn header_values_iterates_duplicates() {
+        let resp = b"HTTP/1.1 101 Switching Protocols\r\n\
+            Connection: keep-alive\r\n\
+            Connection: Upgrade\r\n\
+            \r\n";
+        let (r, _) = parse_response(resp).unwrap().unwrap();
+        let values: Vec<&str> = r.header_values("connection").collect();
+        assert_eq!(values, vec!["keep-alive", "Upgrade"]);
+        assert_eq!(r.header("Connection"), Some("keep-alive"));
     }
 
     #[test]

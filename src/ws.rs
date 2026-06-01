@@ -18,6 +18,6 @@ pub mod handshake;
 pub mod mask;
 pub mod parser;
 
-pub use client::{ConnState, Event, WsClient, WsConfig, WsError};
+pub use client::{ConnState, DataEvent, Event, WsClient, WsConfig, WsError};
 pub use close::CloseCode;
 pub use frame::{FrameError, FrameHeader, MAX_HEADER_LEN, OpCode};

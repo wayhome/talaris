@@ -83,7 +83,7 @@ mod linux_impl {
 
     use hdrhistogram::Histogram;
     use talaris::connection::{ConnectionConfig, State};
-    use talaris::ws::Event as WsEvent;
+    use talaris::ws::{DataEvent as WsDataEvent, Event as WsEvent};
     use talaris::{Pool, PoolConfig};
 
     use super::common;
@@ -122,8 +122,10 @@ mod linux_impl {
         eprintln!(" server-cpu: {server_cpu}  (fresh tokio runtime per variant)");
         eprintln!(" talaris   : user→CPU {talaris_cpu}, SQ_POLL→CPU {sq_poll_cpu}");
         eprintln!(" tokio     : worker→CPU {tokio_cpu}");
-        eprintln!(" buf_ring  : {buf_entries} × {buf_size}B = {} KiB pool",
-            (u32::from(buf_entries) * buf_size) / 1024);
+        eprintln!(
+            " buf_ring  : {buf_entries} × {buf_size}B = {} KiB pool",
+            (u32::from(buf_entries) * buf_size) / 1024
+        );
         eprintln!(" execution : 串行，inline on main thread，每 variant 之间 unpin");
         eprintln!();
 
@@ -145,14 +147,30 @@ mod linux_impl {
         // ── variant 1/3: talaris pool.pump (general path) ────────────────
         eprintln!("─── variant 1/3: talaris Pool.pump (general path, Event enum) ───");
         let talaris = with_fresh_stream_server(server_cpu, chunk_buf.clone(), |addr| {
-            run_talaris(addr, stop, payload, talaris_cpu, sq_poll_cpu, buf_size, buf_entries)
+            run_talaris(
+                addr,
+                stop,
+                payload,
+                talaris_cpu,
+                sq_poll_cpu,
+                buf_size,
+                buf_entries,
+            )
         });
         eprintln!();
 
-        // ── variant 2/3: talaris pool.pump_binary (fast path) ────────────
-        eprintln!("─── variant 2/3: talaris Pool.pump_binary (fast path) ───");
-        let talaris_fast = with_fresh_stream_server(server_cpu, chunk_buf.clone(), |addr| {
-            run_talaris_fast(addr, stop, payload, talaris_cpu, sq_poll_cpu, buf_size, buf_entries)
+        // ── variant 2/3: talaris pool.pump_data (data-only dispatch) ──────
+        eprintln!("─── variant 2/3: talaris Pool.pump_data (data-only dispatch) ───");
+        let talaris_data = with_fresh_stream_server(server_cpu, chunk_buf.clone(), |addr| {
+            run_talaris_data(
+                addr,
+                stop,
+                payload,
+                talaris_cpu,
+                sq_poll_cpu,
+                buf_size,
+                buf_entries,
+            )
         });
         eprintln!();
 
@@ -172,7 +190,7 @@ mod linux_impl {
         println!("{}", "─".repeat(82));
         for (label, o) in [
             ("talaris Pool.pump", &talaris),
-            ("talaris pump_binary", &talaris_fast),
+            ("talaris pump_data", &talaris_data),
             ("tokio", &tokio),
         ] {
             println!(
@@ -184,22 +202,22 @@ mod linux_impl {
                 o.mib_per_sec(payload),
             );
         }
-        let r_fast = talaris_fast.frames_per_sec() / talaris.frames_per_sec();
-        let r_vs_tokio = talaris_fast.frames_per_sec() / tokio.frames_per_sec();
+        let r_data = talaris_data.frames_per_sec() / talaris.frames_per_sec();
+        let r_vs_tokio = talaris_data.frames_per_sec() / tokio.frames_per_sec();
         println!();
         println!(
-            "fast-path gain vs general path: {:.2}× ({:.0} → {:.0} f/s)",
-            r_fast,
+            "data-only dispatch vs general path: {:.2}× ({:.0} → {:.0} f/s)",
+            r_data,
             talaris.frames_per_sec(),
-            talaris_fast.frames_per_sec()
+            talaris_data.frames_per_sec()
         );
-        println!("fast-path vs tokio: {r_vs_tokio:.2}× (1.0 = parity)");
+        println!("pump_data vs tokio: {r_vs_tokio:.2}× (1.0 = parity)");
 
         println!();
         println!("=== inter-arrival latency (delivery jitter) ===");
         common::print_comparison(&[
             ("talaris Pool.pump", &talaris.inter_arrival),
-            ("talaris pump_binary", &talaris_fast.inter_arrival),
+            ("talaris pump_data", &talaris_data.inter_arrival),
             ("tokio", &tokio.inter_arrival),
         ]);
         println!();
@@ -213,11 +231,9 @@ mod linux_impl {
         chunk_buf: Arc<Vec<u8>>,
         body: impl FnOnce(SocketAddr) -> R,
     ) -> R {
-        let listener =
-            TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).expect("bind");
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).expect("bind");
         let addr = listener.local_addr().expect("local_addr");
-        let server =
-            common::spawn_ws_stream_server(listener, 1, chunk_buf, Some(server_cpu));
+        let server = common::spawn_ws_stream_server(listener, 1, chunk_buf, Some(server_cpu));
         eprintln!("[bench] fresh stream server on {addr}, cpu={server_cpu}");
         let result = body(addr);
         server.join().expect("server thread panic");
@@ -234,9 +250,7 @@ mod linux_impl {
         buf_entries: u16,
     ) -> Outcome {
         let _guard = PinGuard::pin("talaris", user_cpu);
-        eprintln!(
-            "[talaris] user→CPU {user_cpu}, SQ_POLL kthread→CPU {sq_poll_cpu}"
-        );
+        eprintln!("[talaris] user→CPU {user_cpu}, SQ_POLL kthread→CPU {sq_poll_cpu}");
 
         let cfg = ConnectionConfig::new("localhost", addr.port(), "/")
             .with_tls(false)
@@ -286,8 +300,8 @@ mod linux_impl {
         }
     }
 
-    /// Same client setup as `run_talaris`, but drain via `pump_binary` (fast path).
-    fn run_talaris_fast(
+    /// Same client setup as `run_talaris`, but drain via `pump_data` (data-only dispatch).
+    fn run_talaris_data(
         addr: SocketAddr,
         stop: StopMode,
         payload: usize,
@@ -296,10 +310,8 @@ mod linux_impl {
         buf_size: u32,
         buf_entries: u16,
     ) -> Outcome {
-        let _guard = PinGuard::pin("talaris-fast", user_cpu);
-        eprintln!(
-            "[talaris-fast] user→CPU {user_cpu}, SQ_POLL kthread→CPU {sq_poll_cpu}"
-        );
+        let _guard = PinGuard::pin("talaris-data", user_cpu);
+        eprintln!("[talaris-data] user→CPU {user_cpu}, SQ_POLL kthread→CPU {sq_poll_cpu}");
 
         let cfg = ConnectionConfig::new("localhost", addr.port(), "/")
             .with_tls(false)
@@ -314,25 +326,32 @@ mod linux_impl {
         let bench_start = Instant::now();
 
         while stop.keep_going(frame_count, bench_start) {
-            pool.pump_binary(|_h, data| {
-                debug_assert_eq!(data.len(), payload);
-                arrivals.push(Instant::now());
-                frame_count += 1;
+            pool.pump_data(|_h, ev| {
+                if let WsDataEvent::Binary(data) = ev {
+                    debug_assert_eq!(data.len(), payload);
+                    arrivals.push(Instant::now());
+                    frame_count += 1;
+                }
             })
-            .expect("pump_binary");
+            .expect("pump_data");
         }
         let elapsed = bench_start.elapsed();
         eprintln!(
-            "[talaris-fast] {} frames in {:.3}s ({:.0} f/s)",
+            "[talaris-data] {} frames in {:.3}s ({:.0} f/s)",
             frame_count,
             elapsed.as_secs_f64(),
             frame_count as f64 / elapsed.as_secs_f64()
         );
 
-        // 退出：直接 drop pool；server 下次 write_all 拿 EPIPE 退出。
-        // 不调 initiate_close —— 那个走 slow path 会和 fast-path Close-frame 严格
-        // 模式打架。
-        drop(pool);
+        // 干净关：pump_data 仍走完整 WS control path，可以正常 close handshake。
+        pool.initiate_close(h, 1000, "bye").ok();
+        let close_start = Instant::now();
+        while close_start.elapsed() < Duration::from_secs(2) {
+            let _ = pool.pump_data_nowait(|_, _| {});
+            if matches!(pool.state(h), Some(State::Closed)) {
+                break;
+            }
+        }
 
         let inter_arrival = common::inter_arrival_hist(&arrivals);
         Outcome {
@@ -342,12 +361,7 @@ mod linux_impl {
         }
     }
 
-    fn run_tokio(
-        addr: SocketAddr,
-        stop: StopMode,
-        payload: usize,
-        user_cpu: usize,
-    ) -> Outcome {
+    fn run_tokio(addr: SocketAddr, stop: StopMode, payload: usize, user_cpu: usize) -> Outcome {
         let _guard = PinGuard::pin("tokio", user_cpu);
         eprintln!("[tokio] worker→CPU {user_cpu}");
 
@@ -365,10 +379,9 @@ mod linux_impl {
                 .expect("ws upgrade");
 
             let bench_start = Instant::now();
-            let (arrivals, frame_count) = common::tokio_recv_ws_binary_frames(
-                &mut s, leftover, stop, payload, bench_start,
-            )
-            .await;
+            let (arrivals, frame_count) =
+                common::tokio_recv_ws_binary_frames(&mut s, leftover, stop, payload, bench_start)
+                    .await;
             let elapsed = bench_start.elapsed();
             eprintln!(
                 "[tokio] {} frames in {:.3}s ({:.0} f/s)",

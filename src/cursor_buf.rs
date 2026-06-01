@@ -1,14 +1,10 @@
-//! `CursorBuf` —— head-cursor buffer，消除 `Vec::drain(..n)` 的 O(n) memmove
-//!
-//! 早期 v1 用裸 `Vec<u8>` + `drain(..n)` 维护 recv/tx/send 三个 buffer。每次
-//! partial-consume 都会把 tail memmove 到 front（O(n)），WS 流式收 frame 的
-//! hot path 上每帧一次 memmove 是测得到的 perf 损失。
+//! `CursorBuf` —— head-cursor buffer
 //!
 //! 这里把 `(data: Vec<u8>, head: usize)` 包装一下：
 //!
 //! - `consume(n)` 仅自增 head；head 追上 len 时整体 `clear()`（O(1) 复原）
-//! - `extend_from_slice` 在 capacity 真要重分配前才做 compact memmove，多数
-//!   情况下 head==0（consume 全部后），完全不 memmove
+//! - `extend_from_slice` 在 capacity 真要重分配前才做 compact memmove，
+//!   多数情况下 head==0（consume 全部后），完全不 memmove
 //! - `as_slice / as_ptr` 始终返回 `&data[head..]` 视图
 //!
 //! 不变式：caller 用 `len()` 拿到的就是 "可读字节数"；`as_slice / as_ptr` 与

@@ -14,8 +14,20 @@
 
 ## TL;DR
 
+```plain
+当前实盘环境实际链路：
+socket
+  -> BufferRing slot               // TLS ciphertext
+  -> rustls.read_tls()
+  -> rustls.process_new_packets()
+  -> rustls.reader()               // TLS plaintext
+  -> plain_buf
+  -> WsClient.recv_buf
+  -> pump_out...
+```
+
 talaris 是**为一类很狭窄的 workload 量身做的 io_uring WebSocket client**：
-HFT 行情订阅 / 下单链路，单线程吃满 N 条 TCP/TLS WebSocket，要的是 p99.9 尾延迟
+HFT 行情订阅，单线程吃满 N 条 TCP/TLS WebSocket，要的是 p99.9 尾延迟
 可预测，不是通用 async runtime。
 
 如果你只是写 Web app / 微服务，**用 tokio 别想这个**。如果你的 workload 满足下面三条
@@ -48,15 +60,17 @@ DMA 到你预留的 buffer 里，你只负责取出来用。
 
 ### 2. Proactor vs Reactor（io_uring 不只是个更快的 epoll）
 
-| | Reactor (epoll / tokio) | Proactor (io_uring / talaris) |
-|---|---|---|
-| 通知粒度 | "fd 可读了" | "数据已经在你的 buffer 里" |
-| 谁干活 | **应用** 调 `read()` syscall 把数据从 kernel 拷到用户 buffer | **kernel** 直接写进你预先注册的 provided buffer，user 端不 syscall |
-| 主循环 | epoll_wait → 遍历 ready fd → 每个 read() | submit & wait → drain CQE → 数据已就位 |
+|      | Reactor (epoll / tokio)                           | Proactor (io_uring / talaris)                         |
+|------|---------------------------------------------------|-------------------------------------------------------|
+| 通知粒度 | "fd 可读了"                                          | "数据已经在你的 buffer 里"                                    |
+| 谁干活  | **应用** 调 `read()` syscall 把数据从 kernel 拷到用户 buffer | **kernel** 直接写进你预先注册的 provided buffer，user 端不 syscall |
+| 主循环  | epoll_wait → 遍历 ready fd → 每个 read()              | submit & wait → drain CQE → 数据已就位                     |
 
 talaris 用的是 multishot recv：**一次 submit**，kernel 持续往你 buffer ring 里
-塞数据 + 每次塞完 post 一个 CQE 告诉你"buffer 哪一格、有多少字节"。整个 inbound
-hot path **零 syscall**（kernel 异步推 + SQ_POLL kthread spin）。
+塞数据 + 每次塞完 post 一个 CQE 告诉你"buffer 哪一格、有多少字节"。SQ_POLL 下
+submit 路径通常不进 syscall；默认阻塞 `pump` 仍会用一次 `wait_for_cqe(1)` 进入
+`io_uring_enter(GETEVENTS)` 等 CQE。要把 steady-state receive loop 做到不等 CQE
+syscall，用 busy-poll 版本 `pump_spin` / `pump_data_spin`，代价是持续占用一个 CPU。
 
 详见 `src/proactor.rs` 顶部的注释 —— 它解释了为什么我们叫 `Proactor` 而不是
 跟 tokio-uring 那样还叫 Reactor。
@@ -85,62 +99,61 @@ let mut pool = Pool::new(PoolConfig::default())?;
 [kernel] ─ 生成 CQE: { user_data: conn_id, result: bytes_written, flags: bid|F_MORE }
 [user]   ─ pool.pump() 在 wait_for_cqe 那一行被唤醒
 [user]   ─ Pool 从 CQE 解出 conn_id, 路由到对应 ConnectionState
-[user]   ─ ConnectionState 拿到 buffer ring entry slice, 喂给 WsClient (或 zero-copy 直解)
-[user]   ─ WsClient 解 frame header, 累积 payload, emit Event::Binary(&[u8])
+[user]   ─ ConnectionState 拿到 buffer ring entry slice, 喂给 WsClient
+[user]   ─ WsClient 先 copy 到自己的 recv buffer，再解 frame header / emit Event::Binary(&[u8])
 [user]   ─ 你的 sink 回调拿到 &[u8] payload, 同步处理
 [user]   ─ buf_ring.recycle(bid) 把那一格还给 kernel
 ```
 
-整条链路 **user 端零 syscall**（除了进 `wait_for_cqe` 那一次 io_uring_enter）。
-跟 tokio 的 read syscall + epoll_wait 比，主要省的是 syscall + scheduler 介入。
+阻塞 `pump` 路径仍有一次 wait syscall；busy-poll `pump_data_spin` 路径则只轮询
+mmap 出来的 CQ ring，不进 `wait_for_cqe`。跟 tokio 的 read syscall + epoll_wait 比，
+主要省的是 per-frame read syscall + scheduler 介入。
 
-### 5. fast path vs general path —— 一定要知道的取舍
+### 5. general events vs data-only dispatch
 
 我们有**两个**收数据的 API：
 
 ```rust
-// General path — 完整 RFC 6455 状态机
+// General events — 完整 RFC 6455 状态机，control/data 都交给业务
 pool.pump(|handle, event| match event {
     WsEvent::Text(s) => ...,
     WsEvent::Binary(buf) => ...,
-    WsEvent::Ping(_) => ...,    // 自动 Pong 已经回了
+    WsEvent::Ping(_) => ...,    // 默认 auto_pong=true 时 Pong 已排队
     WsEvent::Close { code, reason } => ...,
     ...
 })?;
 
-// Fast path — 只认 FIN + Binary + unmasked, 其它都判 protocol error 关连接
-pool.pump_binary(|handle, payload: &[u8]| {
-    // payload 是 kernel buffer 上的 slice, 这次 callback 内有效
+// Data-only dispatch — WS 层仍处理 Ping/Pong/Close，业务只拿 Text/Binary
+pool.pump_data(|handle, data| match data {
+    WsDataEvent::Text(s) => parse_json(s),
+    WsDataEvent::Binary(buf) => parse_sbe(buf),
 })?;
 ```
 
-`pump_binary` 跑得快**得多**（实测 200B payload ~1.33× tokio），代价是：
-- ❌ 不支持 fragmented message
-- ❌ 不支持 Ping / Pong / Close frame（自动关连接当 error）
-- ❌ 不能 auto-pong
+`pump_data` 不是 binary-only fast mode。它走同一套 `WsClient` 状态机，所以：
+- Text JSON feed 可以直接解析 JSON。
+- Binary SBE / protobuf feed 可以直接解析二进制 payload。
+- WebSocket Ping/Pong/Close、fragmentation、UTF-8 校验和 auto-pong 仍然正常工作。
 
-订阅 venue 行情（venue 端只发 FIN-Binary 帧）→ 用 `pump_binary`。
-要做完整 WS 协议（auth / Ping 保活 / graceful close）→ 用 `pump`。
-
-实际生产典型用法：handshake 阶段用 `pump`（让 venue 那边发 HTTP 101 + 跑 WS upgrade 状态机），
-进入 `Open` 状态后**整个数据循环切到 `pump_binary`**。
+要自己观察 Ping/Pong/Close 事件时用 `pump`；行情主循环只关心业务 payload 时用
+`pump_data`。
 
 ---
 
 ## 一句话术语表（cheat sheet）
 
-| 术语 | 一句话解释 | 在代码里 |
-|---|---|---|
-| **Proactor** | io_uring 包了一层的薄壳，提供 submit_recv / submit_send / submit_connect / drain CQE | `src/proactor/uring.rs::Proactor` |
-| **Pool** | 一个 Proactor 驱动 N 条 conn 的 multi-conn driver；单 OS 线程持有 | `src/pool.rs::Pool` |
-| **ConnHandle** | 对外的不透明 conn 引用；本质是个 u32 conn_id | `src/pool.rs::ConnHandle` |
-| **ConnectionConfig** | 单条 conn 的配置：host/port/tls/SQ_POLL/buf_ring | `src/connection.rs::ConnectionConfig` |
-| **BufferRing** | io_uring provided buffer ring：256 格 × 4 KiB 的预注册 buffer 池，kernel 自己挑格子写 | `src/proactor/buf_ring.rs` |
-| **WsClient** | RFC 6455 client 全状态机（handshake / fragmentation / control / auto-pong） | `src/ws/client.rs::WsClient` |
-| **SQ_POLL** | io_uring kernel 端起一条 kthread 在 isolated CPU 上 spin，submit 路径**零 syscall** | `ConnectionConfig::with_sq_poll` |
-| **pin** | 把当前线程钉死在一个 CPU 上，配合 `isolcpus` 用，砍 scheduler 迁移抖动 | `talaris::proactor::pin_current_thread_to` |
-| **pump** | 推进一次 IO：submit + wait + drain CQE + 回调；通用路径 | `Pool::pump` |
-| **pump_binary** | 同上但跳过 WsClient 状态机，只认 Binary frame；inbound stream 用 | `Pool::pump_binary` |
+| 术语                   | 一句话解释                                                                      | 在代码里                                       |
+|----------------------|----------------------------------------------------------------------------|--------------------------------------------|
+| **Proactor**         | io_uring 包了一层的薄壳，提供 submit_recv / submit_send / submit_connect / drain CQE | `src/proactor/uring.rs::Proactor`          |
+| **Pool**             | 一个 Proactor 驱动 N 条 conn 的 multi-conn driver；单 OS 线程持有                      | `src/pool.rs::Pool`                        |
+| **ConnHandle**       | 对外的不透明 conn 引用；本质是个 u32 conn_id                                            | `src/pool.rs::ConnHandle`                  |
+| **ConnectionConfig** | 单条 conn 的配置：host/port/tls/SQ_POLL/buf_ring                                 | `src/connection.rs::ConnectionConfig`      |
+| **BufferRing**       | io_uring provided buffer ring：256 格 × 4 KiB 的预注册 buffer 池，kernel 自己挑格子写    | `src/proactor/buf_ring.rs`                 |
+| **WsClient**         | RFC 6455 client 全状态机（handshake / fragmentation / control / auto-pong）      | `src/ws/client.rs::WsClient`               |
+| **SQ_POLL**          | io_uring kernel 端起一条 kthread 在 isolated CPU 上 spin，submit 路径**零 syscall**  | `ConnectionConfig::with_sq_poll`           |
+| **pin**              | 把当前线程钉死在一个 CPU 上，配合 `isolcpus` 用，砍 scheduler 迁移抖动                          | `talaris::proactor::pin_current_thread_to` |
+| **pump**             | 推进一次 IO：submit + wait + drain CQE + 回调；通用路径                                | `Pool::pump`                               |
+| **pump_data**        | 同上但只把 Text/Binary data 交给业务；control frame 仍由 WS 层处理                         | `Pool::pump_data`                          |
 
 ---
 
@@ -184,11 +197,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### 生产配置: pin + SQ_POLL + fast-path
+### 生产配置: pin + SQ_POLL + data-only dispatch
 
 ```rust
 use talaris::connection::{ConnectionConfig, State};
 use talaris::proactor::pin_current_thread_to;
+use talaris::ws::DataEvent as WsDataEvent;
 use talaris::{Pool, PoolConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -200,7 +214,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     pin_current_thread_to(1)?;
 
     // 2. 配置一条订阅 conn
-    //    - SQ_POLL kthread 钉到 CPU 5（CPU 1 的 SMT sibling，L1/L2 共享）
+    //    - SQ_POLL kthread 钉到 CPU 5（CPU 1 的 SMT sibling；只是候选拓扑，需压测）
     //    - buf_ring 单格 8 KiB（payload ~400B → 8KiB 一格装 ~20 帧）
     let cfg = ConnectionConfig::new("test.deribit.com", 443, "/ws/api/v2")
         .with_tls(true)
@@ -213,16 +227,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 4. (生产里通常这里发 subscribe 消息, 用 pool.send_text)
 
-    // 5. 进入 fast-path 数据循环
+    // 5. 进入 data-only 数据循环。WS 层仍处理 Ping/Pong/Close；
+    //    业务层只拿 JSON Text 或 SBE Binary payload。
     loop {
-        pool.pump_binary(|_h, payload| {
-            // payload 是 kernel buf_ring entry 上的 slice, 这次 callback 内有效
-            // 这里做你的解码 / 路由 / 策略
-            decode_market_data(payload);
+        pool.pump_data(|_h, data| match data {
+            WsDataEvent::Text(s) => decode_json_market_data(s),
+            WsDataEvent::Binary(payload) => decode_sbe_market_data(payload),
         })?;
     }
 }
-# fn decode_market_data(_: &[u8]) {}
+# fn decode_json_market_data(_: &str) {}
+# fn decode_sbe_market_data(_: &[u8]) {}
 ```
 
 更完整的可运行例子见 [`examples/quickstart.rs`](examples/quickstart.rs)。
@@ -242,11 +257,14 @@ let h: ConnHandle = pool.connect_blocking(cfg)?;
 // 主动发
 pool.send_text(h, b"...")?;       // RFC 6455 Text frame
 pool.send_binary(h, b"...")?;     // RFC 6455 Binary frame
+pool.send_ping(h, b"hb")?;        // RFC 6455 Ping control frame
+pool.send_pong(h, b"hb")?;        // RFC 6455 Pong control frame
 pool.initiate_close(h, 1000, "bye")?;  // 主动关连接
 
 // 推进 IO 一次 (这是 hot loop)
 pool.pump(|h, ev| { ... })?;          // 通用路径
-pool.pump_binary(|h, payload| { ... })?;  // 高吞吐 inbound 用
+pool.pump_data(|h, data| { ... })?;   // 只分发 Text/Binary data
+let got = pool.pump_data_spin(256, |h, data| { ... })?; // busy-poll, 不等 CQE syscall
 
 // 查状态
 pool.state(h);  // Option<State>: Init / Connecting / TlsHandshake / WsHandshake / Open / Closing / Closed
@@ -274,8 +292,8 @@ re-arm，但 burst 头几帧延迟会受影响）。
 
 ### `with_sq_poll(idle_ms, cpu)` —— 砍 submit syscall
 
-**只在持续高频 IO 下回本**：kthread 在 isolated CPU 上 spin 持续 spin，user 端 submit
-就不进 syscall。代价是 idle 期间也烧那一个 CPU。
+**只在持续高频 IO 下回本**：kthread 在 isolated CPU 上持续轮询，user 端 submit
+就不进 syscall。代价是 idle 期间也会持续占用那个 CPU。
 
 - 持续行情 push（venue feed）：开。
 - 单次 RPC / 偶发 IO：**别开**，反而慢（kthread 协调开销 > 省下的 syscall 成本）。
@@ -297,13 +315,14 @@ re-arm，但 burst 头几帧延迟会受影响）。
 ```
 CPU 0          ← OS noise (IRQ / kthread / cron)
 CPU 1   (iso)  ← talaris user thread (pin here)
-CPU 5   (iso)  ← talaris SQ_POLL kthread (CPU 1 的 SMT sibling, L1/L2 共享)
+CPU 5   (iso)  ← talaris SQ_POLL kthread (CPU 1 的 SMT sibling 候选)
 CPU 2,3,4 (iso)← 备用 / 第二条 Pool
 CPU 6, 7       ← OS noise
 ```
 
 SMT sibling pair 把 user thread 和 SQ_POLL kthread 钉到同一物理核的两条 SMT 上，
-buffer ring / SQ ring 的 cache coherency 几乎免费。
+cacheline 传递可能更近，但两条线程也会共享执行资源；是否优于独立 physical core
+要以目标机器上的压测结果为准。
 
 ---
 
@@ -346,11 +365,16 @@ let pool2 = Pool::new(...)?;
 `pool.pump(...)` 内部走 `wait_for_cqe(1)`，**至少等到 1 个 CQE 才返回**。如果你不希望
 阻塞（譬如要在同一 loop 里做别的事），用 `pool.pump_nowait(...)`。
 
-### 3. `pump_binary` 看到任何非 Binary 帧就关连接
+如果你愿意在 isolated CPU 上 busy-spin，`pool.pump_spin(spin_iters, ...)` /
+`pool.pump_data_spin(spin_iters, ...)` 会只轮询 CQ ring，不调用 `wait_for_cqe(1)`。
+返回的 `bool` 表示这一轮是否处理到了 CQE / frame；返回 `false` 时可以继续 spin，
+或降级到阻塞 `pump`。
 
-包括 Ping。venue 如果开了 keep-alive Ping，你 fast-path 会被立刻判 protocol error。
-解决：要么 venue 端关 Ping，要么混用 pump（定期 pump 几次让 Ping 走通用路径），
-要么自己接管 Ping（接 raw TCP 自己解，更激进）。
+### 3. 业务只想要行情 payload 时用 `pump_data`
+
+交易所 WebSocket 通常会混合 Text JSON、Binary SBE 和 Ping/Pong/Close control
+frame。`pump_data` 会完整处理 control frame，只把 Text/Binary data 交给业务；
+如果你需要记录 Pong 延迟或 Close reason，改用 `pump`。
 
 ### 4. SQ_POLL 在低负载下反而慢
 
@@ -424,7 +448,7 @@ Tested on Linux 6.x with io_uring features: `SETUP_SQPOLL`,
 |---|---|
 | `ws_framing` | 纯 CPU 帧编解码（mask / encode_header / parse_header / compute_accept） |
 | `ws_ingress_raw` | 绕开 Pool + WsClient, 直接 Proactor + BufferRing 收 Binary 帧 |
-| `ws_ingress_single` | Pool.pump vs Pool.pump_binary vs tokio (单 conn, 稳态满速) |
+| `ws_ingress_single` | Pool.pump vs Pool.pump_data vs tokio (单 conn, 稳态满速) |
 | `ws_ingress_fanout` | N ∈ {1,4,16,64} 条 conn 同时收 (talaris Pool 路由 vs tokio N task) |
 
 跑法：

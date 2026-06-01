@@ -34,6 +34,9 @@ pub enum HandshakeError {
     /// RFC §4.1 step 6 要求 client 必须 fail。
     #[error("server returned unexpected Sec-WebSocket-Protocol: {0}")]
     BadSubprotocol(String),
+    /// 当前 client 不发送 Sec-WebSocket-Extensions；server 回任意扩展都必须 fail。
+    #[error("server returned unexpected Sec-WebSocket-Extensions: {0}")]
+    BadExtension(String),
 }
 
 /// 生成 16 字节随机数并 base64 编码（24 字符 + "=="）
@@ -110,27 +113,39 @@ pub fn verify_upgrade_response(
     if response.status != 101 {
         return Err(HandshakeError::BadStatus(response.status));
     }
-    let upgrade = response
-        .header("Upgrade")
-        .ok_or(HandshakeError::MissingHeader("Upgrade"))?;
-    if !upgrade.eq_ignore_ascii_case("websocket") {
+    if !response.header_values("Upgrade").any(|value| {
+        value
+            .split(',')
+            .any(|s| s.trim().eq_ignore_ascii_case("websocket"))
+    }) {
+        if response.header("Upgrade").is_none() {
+            return Err(HandshakeError::MissingHeader("Upgrade"));
+        }
         return Err(HandshakeError::BadUpgrade);
     }
-    let connection = response
-        .header("Connection")
-        .ok_or(HandshakeError::MissingHeader("Connection"))?;
-    let has_upgrade = connection
-        .split(',')
-        .any(|s| s.trim().eq_ignore_ascii_case("Upgrade"));
-    if !has_upgrade {
+
+    if !response.header_values("Connection").any(|value| {
+        value
+            .split(',')
+            .any(|s| s.trim().eq_ignore_ascii_case("Upgrade"))
+    }) {
+        if response.header("Connection").is_none() {
+            return Err(HandshakeError::MissingHeader("Connection"));
+        }
         return Err(HandshakeError::BadConnection);
     }
+
     let accept = response
         .header("Sec-WebSocket-Accept")
         .ok_or(HandshakeError::MissingHeader("Sec-WebSocket-Accept"))?;
     if !verify_accept(client_key, accept) {
         return Err(HandshakeError::BadAccept);
     }
+
+    if let Some(ext) = response.header("Sec-WebSocket-Extensions") {
+        return Err(HandshakeError::BadExtension(ext.to_owned()));
+    }
+
     // RFC §4.1 step 6：server 在 Sec-WebSocket-Protocol 里回的值必须是 client
     // offered 的某一项。client 没 offer 时，server 不应该回这个 header；
     // 如果它回了，按 RFC 也是 protocol violation。
@@ -139,9 +154,7 @@ pub fn verify_upgrade_response(
         if offered_subprotocols.is_empty() {
             return Err(HandshakeError::BadSubprotocol(server_proto.to_owned()));
         }
-        // server 可以返回 single value（合法）或 0 value（header 缺）。返回多值
-        // 是 protocol violation；这里宽松一点，只要 trim 后能在 offered 中找到
-        // 即可（部分 server 实现会 echo 带空格的多值）。
+        // server 只能选择一个 client offered 的 subprotocol；返回多值不是合法选择。
         if !offered_subprotocols
             .iter()
             .any(|o| o.eq_ignore_ascii_case(server_proto))
@@ -250,8 +263,8 @@ mod tests {
             Sec-WebSocket-Protocol: notice\r\n\
             \r\n";
         let (r, _) = parse_response(resp).unwrap().unwrap();
-        let err = verify_upgrade_response(&r, "dGhlIHNhbXBsZSBub25jZQ==", &["chat", "echo"])
-            .unwrap_err();
+        let err =
+            verify_upgrade_response(&r, "dGhlIHNhbXBsZSBub25jZQ==", &["chat", "echo"]).unwrap_err();
         assert!(matches!(err, HandshakeError::BadSubprotocol(_)));
     }
 
@@ -276,5 +289,30 @@ mod tests {
             \r\n";
         let (r, _) = parse_response(resp).unwrap().unwrap();
         verify_upgrade_response(&r, "dGhlIHNhbXBsZSBub25jZQ==", &[]).unwrap();
+    }
+
+    #[test]
+    fn verify_connection_split_headers() {
+        let resp = b"HTTP/1.1 101 OK\r\n\
+            Upgrade: websocket\r\n\
+            Connection: keep-alive\r\n\
+            Connection: Upgrade\r\n\
+            Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\
+            \r\n";
+        let (r, _) = parse_response(resp).unwrap().unwrap();
+        verify_upgrade_response(&r, "dGhlIHNhbXBsZSBub25jZQ==", &[]).unwrap();
+    }
+
+    #[test]
+    fn verify_rejects_unsolicited_extension() {
+        let resp = b"HTTP/1.1 101 OK\r\n\
+            Upgrade: websocket\r\n\
+            Connection: Upgrade\r\n\
+            Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\
+            Sec-WebSocket-Extensions: permessage-deflate\r\n\
+            \r\n";
+        let (r, _) = parse_response(resp).unwrap().unwrap();
+        let err = verify_upgrade_response(&r, "dGhlIHNhbXBsZSBub25jZQ==", &[]).unwrap_err();
+        assert!(matches!(err, HandshakeError::BadExtension(_)));
     }
 }

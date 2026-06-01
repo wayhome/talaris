@@ -1,32 +1,17 @@
-//! network —— hot-path 通信层
+//! talaris —— 专门为 HFT 行情订阅系统打造的 hot-path 通信层
 //!
-//! io_uring proactor + 自实现 WS (RFC 6455) + TLS + HTTP/1.1 codec。所有上层
-//! adapter 只走这一份 IO 实现。
+//! io_uring proactor + 自实现 WS (RFC 6455) + TLS + HTTP/1.1 codec。
 //!
-//! ## 当前 v1 read-only ready
+//! ## 当前 v0.1 scope
 //!
-//! - [`ws`]   RFC 6455 client 全栈（frame / mask / parser / handshake / close / client）
-//! - [`tls`]  rustls 字节驱动 adapter（ALPN http/1.1）
-//! - [`http`] 最小 HTTP/1.1 codec（WS upgrade response 解析；REST client 缺）
-//! - [`proactor`] io_uring 完整原语：F1 connect/recv/send/close + F2 driver
-//!   + F3 SQ_POLL/pin_core/BufferRing(multishot)/IO_LINK
-//! - [`pool`]   multi-conn driver：1 [`proactor`] 服务 N 条 WS，CQE 按 conn_id
-//!   路由；recv 路径零拷贝（raw ptr split borrow），单条 conn 也走 Pool。
-//! - [`connection`] 公共类型 [`State`] / [`ConnectionConfig`] / [`ConnectionError`]
-//!   及 buf_ring 常量；driver 实现见 [`pool`] / `connection_state`。
-//!
-//! ## 待加（按需 just-in-time）
-//!
-//! - **HMAC** —— Deribit / Binance auth signature。Phase 4.5 authenticated
-//!   subscribe / Phase 5 下单时加
-//! - **JWT (ES256/EdDSA)** —— Deribit fork token。同上
-//! - **rate-limit (token bucket)** —— order rate 守门。Phase 5 下单时加
-//! - **HTTP/1.1 真客户端**（keep-alive + REST）—— Deribit REST API（如
-//!   get_instruments）。仅 cold start 用，Phase 4+ 需要时加
-//! - **重连 supervisor** —— cold side tokio，不在 hot IO 路径。属 adapter / bot 层
+//! - [`ws`]         RFC 6455 client core（handshake / frame / mask / parser / fragmentation / control / close）
+//! - [`tls`]        rustls 字节驱动 adapter（ALPN http/1.1 requested + verified）
+//! - [`http`]       最小 HTTP/1.1 codec（WS upgrade request/response；无 REST client）
+//! - [`proactor`]   io_uring 原语：connect/recv/send/close、SQ_POLL、pin、provided BufferRing、multishot recv；暴露 IO_LINK flag
+//! - [`pool`]       单线程 multi-conn driver：1 个 proactor 驱动 N 条 WS；`pump_data` 只把 Text/Binary data 交给业务，control frame 仍走完整 WS 状态机
+//! - [`connection`] 公共配置 / 状态 / 错误类型
 
 #![forbid(unsafe_op_in_unsafe_fn)]
-// 以下 allow 是真正的 style / 不关 HFT 正确性的 lint —— 留 crate-level OK
 #![allow(clippy::borrow_as_ptr)]
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_ptr_alignment)]
@@ -54,20 +39,22 @@
 #![allow(clippy::redundant_closure_for_method_calls)]
 #![allow(clippy::redundant_pub_crate)]
 #![cfg_attr(test, allow(clippy::float_cmp))]
-// 注意：早期版本在这里 crate-wide allow 了 `unwrap_used / expect_used / panic`，
-// 等于把 Cargo.toml [lints.clippy] 配的 HFT 守门 lint 全废了。现在改回 warn，
-// 个别真需要 panic-on-invariant 的位置改用 module-level / item-level allow。
 
-pub(crate) mod cursor_buf;
-pub mod http;
-pub mod proactor;
-pub mod tls;
+pub mod connection;
+
+pub mod pool;
+
 pub mod ws;
 
-// TEMP: gate 打开做 cross-platform type-check（macOS 路径走 proactor/stub.rs）
-pub mod connection;
+pub mod tls;
+
+pub mod proactor;
+
+pub mod http;
+
+pub(crate) mod cursor_buf;
+
 pub(crate) mod connection_state;
-pub mod pool;
 
 pub use pool::{ConnHandle, Pool, PoolConfig};
 

@@ -509,7 +509,7 @@ unbuffered API 也保留为 benchmark-only probe；当前稳态不优于 buffere
 保留下来的是更窄的优化：`pump_data` 只在 rustls 确实产出 plaintext 后 drain
 WebSocket。一次 `1000 万帧` spin 诊断里，`645,716` 次 CQE 中有 `486,981` 次可跳过
 空 drain。此优化减少无效工作，但东京机 `5000 万帧`、统计关闭的长跑仍为
-`11.30 M frame/s`，低于 fair tokio 同 `WsClient` 的 `14.48 M frame/s`；当前树不能
+`12.08 M frame/s`，低于 fair tokio 同 `WsClient` 的 `14.84 M frame/s`；当前树不能
 宣称吞吐已经超过 tokio。
 
 相关上游语义见

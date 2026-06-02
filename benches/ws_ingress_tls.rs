@@ -554,6 +554,11 @@ mod linux_impl {
             fmt_int(stats.recv_data_cqes),
             stats.recv_ring_exhaustions,
         );
+        println!(
+            "{label:<22} | ws-drains={:>10} | ws-drain-skips={:>10}",
+            fmt_int(stats.ws_data_drains),
+            fmt_int(stats.ws_data_drain_skips),
+        );
         if stats.tls_records > 0 {
             let copied_pct = stats.tls_staged_bytes as f64 / stats.recv_bytes.max(1) as f64 * 100.0;
             println!(

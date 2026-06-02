@@ -23,6 +23,12 @@ use crate::proactor::{
 use crate::tls::TlsAdapter;
 use crate::ws::{ConnState as WsConnState, WsClient, WsConfig};
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum WsIngressState {
+    Clean,
+    Dirty,
+}
+
 /// 单连接驱动状态。Pool 持 `Vec<ConnectionState>`，每条都有独立的 socket /
 /// buf_ring / send_buf / ws；唯一共享的是 Pool 拥有的 [`Proactor`]。
 pub(crate) struct ConnectionState {
@@ -54,6 +60,10 @@ pub(crate) struct ConnectionState {
     pub(crate) send_inflight: bool,
     pub(crate) multishot_armed: bool,
     pub(crate) ws_handshake_begun: bool,
+    /// Data-pump hint: at least one plaintext slice reached `ws.feed_recv` since
+    /// the last WebSocket drain. TLS recv CQEs that only extend a partial record
+    /// leave this false, so the data hot path can skip a guaranteed no-op drain.
+    ws_ingress: WsIngressState,
     pub(crate) ingress_stats: IngressStats,
     pub(crate) cfg: ConnectionConfig,
 }
@@ -98,6 +108,7 @@ impl ConnectionState {
             send_inflight: false,
             multishot_armed: false,
             ws_handshake_begun: false,
+            ws_ingress: WsIngressState::Clean,
             ingress_stats: IngressStats::default(),
             cfg,
         })
@@ -390,9 +401,14 @@ impl ConnectionState {
             // 它由 try_submit_send 在 `!send_inflight` 时 drain。这里直接 append
             // 让 rustls 把 handshake reply / re-key / alert 密文堆进去。
             let ws = &mut self.ws;
+            let mut fed_plaintext = false;
             tls.ingest_ciphertext(bytes, &mut self.tls_pending_out, |plaintext| {
                 ws.feed_recv(plaintext);
+                fed_plaintext = true;
             })?;
+            if fed_plaintext {
+                self.ws_ingress = WsIngressState::Dirty;
+            }
             if !tls.is_handshaking()
                 && matches!(self.state, State::TlsHandshake)
                 && !self.ws_handshake_begun
@@ -412,6 +428,7 @@ impl ConnectionState {
             Ok(())
         } else {
             self.ws.feed_recv(bytes);
+            self.ws_ingress = WsIngressState::Dirty;
             Ok::<_, ConnectionError>(())
         };
 
@@ -436,6 +453,32 @@ impl ConnectionState {
                 self.ingress_stats.recv_ring_exhaustions.saturating_add(1);
         }
     }
+
+    /// Consume the plaintext-ingress hint for the data-only hot path and record
+    /// whether its per-CQE WebSocket drain can do useful work.
+    #[inline]
+    pub(crate) fn take_ws_ingress_dirty_for_data_drain(&mut self) -> bool {
+        let dirty =
+            std::mem::replace(&mut self.ws_ingress, WsIngressState::Clean) == WsIngressState::Dirty;
+        if self.cfg.track_ingress_stats {
+            if dirty {
+                self.ingress_stats.ws_data_drains =
+                    self.ingress_stats.ws_data_drains.saturating_add(1);
+            } else {
+                self.ingress_stats.ws_data_drain_skips =
+                    self.ingress_stats.ws_data_drain_skips.saturating_add(1);
+            }
+        }
+        dirty
+    }
+
+    /// Generic pump drains the WebSocket state machine unconditionally after a
+    /// CQE batch. Clear the data-pump hint so switching APIs cannot observe it.
+    #[inline]
+    pub(crate) fn clear_ws_ingress_dirty(&mut self) {
+        self.ws_ingress = WsIngressState::Clean;
+    }
+
     /// pump 主循环末尾调一次：WS 内部状态切到 Closed 时，外层 state 同步到
     /// Closing（不直接跳 Closed —— 仍可能有未发完的 close 帧或未到的 close CQE）。
     pub(crate) fn sync_ws_close_state(&mut self) {

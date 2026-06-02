@@ -95,6 +95,10 @@ pub struct IngressStats {
     pub recv_bytes: u64,
     /// Multishot recv terminations caused by provided-buffer ring exhaustion.
     pub recv_ring_exhaustions: u64,
+    /// Data-pump CQEs that fed plaintext into the WebSocket receive buffer.
+    pub ws_data_drains: u64,
+    /// Data-pump CQEs that skipped WebSocket draining because no plaintext arrived.
+    pub ws_data_drain_skips: u64,
     /// Complete TLS records handed to rustls by the opt-in record stager.
     pub tls_records: u64,
     /// Records already complete in one CQE slice and passed through without staging copy.

@@ -404,7 +404,9 @@ impl Pool {
             if let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut) {
                 match conn.handle_completion(proactor, c) {
                     Ok(()) => {
-                        drain_conn_data_events(conn, &mut sink, &mut first_err);
+                        if conn.take_ws_ingress_dirty_for_data_drain() {
+                            drain_conn_data_events(conn, &mut sink, &mut first_err);
+                        }
                     }
                     Err(e) => fail_conn(conn, e, &mut first_err),
                 }
@@ -536,6 +538,7 @@ impl Pool {
             }
             conn.sync_ws_open_state();
             conn.sync_ws_close_state();
+            conn.clear_ws_ingress_dirty();
         }
 
         sync_active_count(conns, active_count);
@@ -579,6 +582,7 @@ impl Pool {
                 }
                 conn.sync_ws_open_state();
                 conn.sync_ws_close_state();
+                conn.clear_ws_ingress_dirty();
             }
 
             if progressed || first_err.is_some() {
@@ -690,7 +694,9 @@ where
         if let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut) {
             match conn.handle_completion(proactor, c) {
                 Ok(()) => {
-                    drain_conn_data_events(conn, sink, first_err);
+                    if conn.take_ws_ingress_dirty_for_data_drain() {
+                        drain_conn_data_events(conn, sink, first_err);
+                    }
                 }
                 Err(e) => fail_conn(conn, e, first_err),
             }

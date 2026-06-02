@@ -234,6 +234,7 @@ mod linux_impl {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_talaris(
         addr: SocketAddr,
         n_conns: u32,

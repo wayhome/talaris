@@ -515,7 +515,9 @@ mod tests {
         if !proactor.supports_recvsend_bundle() {
             return;
         }
-        let payload: Vec<u8> = (0..16 * 1024).map(|n| (n % 251) as u8).collect();
+        let payload: Vec<u8> = (0_u16..16 * 1024)
+            .map(|n| u8::try_from(n % 251).unwrap())
+            .collect();
         let expected = payload.clone();
         let server = thread::spawn(move || {
             let (mut s, _) = listener.accept().unwrap();

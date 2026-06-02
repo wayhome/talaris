@@ -72,8 +72,6 @@ pub enum ProactorError {
     SqFull,
     #[error("io_uring submit failed: {0}")]
     Submit(#[source] io::Error),
-    #[error("kernel does not support IORING_RECVSEND_BUNDLE (requires Linux 6.10+)")]
-    RecvsendBundleUnsupported,
 }
 
 /// io_uring proactor。**单线程拥有**——不实现 `Send` / `Sync`（`IoUring` 内部
@@ -284,41 +282,6 @@ impl Proactor {
                 .map_err(|_| ProactorError::SqFull)?;
         }
         Ok(())
-    }
-
-    /// 提交 bundle 版 multishot recv。一次 CQE 可以消费 provided buffer ring 中
-    /// 连续多块 buffer，减少 CQE 和 networking-stack round trip。
-    ///
-    /// # Safety
-    ///
-    /// `fd` 必须有效；`buf_group` 必须先用 [`Self::register_buf_ring`] 注册。
-    pub unsafe fn submit_recv_multishot_bundle(
-        &mut self,
-        fd: RawFd,
-        buf_group: u16,
-        user_data: UserData,
-    ) -> Result<(), ProactorError> {
-        if !self.supports_recvsend_bundle() {
-            return Err(ProactorError::RecvsendBundleUnsupported);
-        }
-        let entry = opcode::RecvMultiBundle::new(Fd(fd), buf_group)
-            .build()
-            .user_data(user_data.raw());
-        // SAFETY: caller 保证 fd 有效；entry 自带 BUFFER_SELECT 标志
-        unsafe {
-            self.ring
-                .submission()
-                .push(&entry)
-                .map_err(|_| ProactorError::SqFull)?;
-        }
-        Ok(())
-    }
-
-    /// 当前内核是否声明支持 `IORING_RECVSEND_BUNDLE`。该 feature 自 Linux 6.10
-    /// 起可用；显式 opt-in 的连接在不支持时应直接报错，不静默改变性能语义。
-    #[must_use]
-    pub fn supports_recvsend_bundle(&self) -> bool {
-        self.ring.params().is_feature_recvsend_bundle()
     }
 
     /// 注册一个 provided buffer ring 到 kernel。一般通过 [`super::BufferRing::new`]

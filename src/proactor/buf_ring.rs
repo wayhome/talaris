@@ -57,14 +57,6 @@ pub enum BufferRingError {
     AllocFailed,
     #[error("proactor: {0}")]
     Proactor(#[from] ProactorError),
-    #[error("bundle CQE started at bid {actual}, expected {expected} from buffer-ring order")]
-    InvalidBundleStart { expected: u16, actual: u16 },
-    #[error("bundle CQE length {bytes} exceeds {entries} buffers x {buf_size} bytes")]
-    BundleTooLarge {
-        bytes: usize,
-        entries: u16,
-        buf_size: u32,
-    },
 }
 
 /// 与 kernel 共享的 provided buffer pool。
@@ -107,9 +99,6 @@ pub struct BufferRing {
     bgid: u16,
     /// 本地 tail 计数（u16 自然 wraparound）。每次 recycle 自增 + Release store 到 kernel。
     local_tail: u16,
-    /// 用户态缓存的 kernel consumption head。recv bundle CQE 只返回第一个 bid 和
-    /// 总字节数；后续 buffer 必须按 ring head 顺序展开。
-    bundle_head: u16,
     /// 是否已 unregister。Drop 时 best-effort 处理。
     unregistered: bool,
 }
@@ -125,7 +114,6 @@ impl std::fmt::Debug for BufferRing {
             .field("entries", &self.entries)
             .field("buf_size", &self.buf_size)
             .field("local_tail", &self.local_tail)
-            .field("bundle_head", &self.bundle_head)
             .field("unregistered", &self.unregistered)
             .finish()
     }
@@ -155,12 +143,10 @@ impl BufferRing {
         let raw = unsafe { alloc_zeroed(ring_layout) };
         // PAGE_SIZE (4096) ≫ align_of::<BufRingEntry>() (8)，layout 已保证对齐。
         #[allow(clippy::cast_ptr_alignment)]
-        let ring_mem =
-            NonNull::new(raw.cast::<BufRingEntry>()).ok_or(BufferRingError::AllocFailed)?;
+        let ring_mem = NonNull::new(raw.cast::<BufRingEntry>()).ok_or(BufferRingError::AllocFailed)?;
 
-        let buf_storage: ManuallyDrop<Box<[u8]>> = ManuallyDrop::new(
-            vec![0_u8; usize::from(entries) * buf_size as usize].into_boxed_slice(),
-        );
+        let buf_storage: ManuallyDrop<Box<[u8]>> =
+            ManuallyDrop::new(vec![0_u8; usize::from(entries) * buf_size as usize].into_boxed_slice());
         let buf_base = buf_storage.as_ptr() as u64;
 
         // 初始化所有 entries：第 i 个 entry 指向 buf_storage[i*buf_size..(i+1)*buf_size]，bid = i
@@ -193,7 +179,6 @@ impl BufferRing {
             buf_size,
             bgid,
             local_tail: entries,
-            bundle_head: 0,
             unregistered: false,
         })
     }
@@ -224,11 +209,7 @@ impl BufferRing {
     /// 如果 `bid >= entries`（bug：CQE 返回了未知 bid）。
     #[must_use]
     pub fn buffer(&self, bid: u16) -> &[u8] {
-        assert!(
-            bid < self.entries,
-            "bid {bid} out of range {}",
-            self.entries
-        );
+        assert!(bid < self.entries, "bid {bid} out of range {}", self.entries);
         let offset = usize::from(bid) * self.buf_size as usize;
         // SAFETY: bid < entries; buf_storage 长度 = entries * buf_size
         unsafe {
@@ -293,56 +274,6 @@ impl BufferRing {
         unsafe { AtomicU16::from_ptr(tail_ptr) }.store(self.local_tail, Ordering::Release);
     }
 
-    /// 把 recv bundle CQE 展开成 `(bid, readable_len)`。`first_bid` 来自 CQE flags，
-    /// `total_len` 来自 CQE result。输出顺序就是 wire 顺序。
-    ///
-    /// bundle CQE 只给第一个 bid；剩余 buffer 要沿 kernel 消费 ring 的顺序读取，
-    /// 不能假设业务层看到的 bid 永远数值连续。调用方处理完所有 slice 后，必须按
-    /// `out` 顺序逐个 [`recycle`](Self::recycle)。
-    pub(crate) fn bundle_layout(
-        &mut self,
-        first_bid: u16,
-        total_len: usize,
-        out: &mut Vec<(u16, usize)>,
-    ) -> Result<(), BufferRingError> {
-        out.clear();
-        if total_len == 0 {
-            return Ok(());
-        }
-
-        let buf_size = self.buf_size as usize;
-        let buffers = total_len.div_ceil(buf_size);
-        if buffers > usize::from(self.entries) {
-            return Err(BufferRingError::BundleTooLarge {
-                bytes: total_len,
-                entries: self.entries,
-                buf_size: self.buf_size,
-            });
-        }
-
-        let mask = self.entries - 1;
-        let mut remaining = total_len;
-        for offset in 0..buffers {
-            let slot = self.bundle_head.wrapping_add(offset as u16) & mask;
-            // SAFETY: slot < entries（mask 保证）；CQE 已发布说明 kernel 已消费该
-            // ring entry，调用方还未 recycle，因此 entry 的 bid/len 仍稳定。
-            let entry = unsafe { &*self.ring_mem.as_ptr().add(usize::from(slot)) };
-            let bid = entry.bid();
-            if offset == 0 && bid != first_bid {
-                return Err(BufferRingError::InvalidBundleStart {
-                    expected: bid,
-                    actual: first_bid,
-                });
-            }
-            let readable = remaining.min(entry.len() as usize);
-            out.push((bid, readable));
-            remaining -= readable;
-        }
-        debug_assert_eq!(remaining, 0);
-        self.bundle_head = self.bundle_head.wrapping_add(buffers as u16);
-        Ok(())
-    }
-
     /// 通知 kernel 解除注册。在 drop 前**必须**调一次，否则 kernel 持着已
     /// 释放内存的地址（UB 风险）。
     pub fn unregister(&mut self, proactor: &mut Proactor) -> Result<(), BufferRingError> {
@@ -392,9 +323,7 @@ impl Drop for BufferRing {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
-    use crate::proactor::{
-        Domain, OpKind, ProactorConfig, SockAddr, SqeFlags, TcpSocket, UserData,
-    };
+    use crate::proactor::{Domain, OpKind, ProactorConfig, SockAddr, SqeFlags, TcpSocket, UserData};
     use std::io::Write;
     use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
     use std::thread;
@@ -427,12 +356,7 @@ mod tests {
         // SAFETY: sock_addr 跟函数同寿命
         unsafe {
             proactor
-                .submit_connect(
-                    fd,
-                    &sock_addr,
-                    UserData::new(OpKind::Connect, 0),
-                    SqeFlags::NONE,
-                )
+                .submit_connect(fd, &sock_addr, UserData::new(OpKind::Connect, 0), SqeFlags::NONE)
                 .unwrap();
         }
         proactor.submit_and_wait(1).unwrap();
@@ -502,95 +426,6 @@ mod tests {
         assert!(got_world, "should have received \"world\"");
 
         // 清理
-        ring.unregister(&mut proactor).unwrap();
-        server.join().unwrap();
-    }
-
-    /// Linux 6.10+ recv bundle：一条 CQE 可以消费 ring 中连续多块 buffer。
-    #[test]
-    fn multishot_recv_bundle_roundtrip() {
-        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let local_addr = listener.local_addr().unwrap();
-        let mut proactor = Proactor::new(ProactorConfig::default()).unwrap();
-        if !proactor.supports_recvsend_bundle() {
-            return;
-        }
-        let payload: Vec<u8> = (0_u16..16 * 1024)
-            .map(|n| u8::try_from(n % 251).unwrap())
-            .collect();
-        let expected = payload.clone();
-        let server = thread::spawn(move || {
-            let (mut s, _) = listener.accept().unwrap();
-            s.set_nodelay(true).unwrap();
-            s.write_all(&payload).unwrap();
-        });
-
-        let sock_addr = SockAddr::from_std(local_addr);
-        let socket = TcpSocket::new(Domain::V4).unwrap();
-        socket.set_nodelay(true).unwrap();
-        let fd = socket.as_raw_fd();
-
-        // SAFETY: sock_addr 跟函数同寿命。
-        unsafe {
-            proactor
-                .submit_connect(
-                    fd,
-                    &sock_addr,
-                    UserData::new(OpKind::Connect, 0),
-                    SqeFlags::NONE,
-                )
-                .unwrap();
-        }
-        proactor.submit_and_wait(1).unwrap();
-        proactor.drain_completions(|c| assert!(c.to_result().is_ok()));
-
-        let mut ring = BufferRing::new(
-            &mut proactor,
-            /*bgid=*/ 1,
-            /*entries=*/ 512,
-            /*buf_size=*/ 64,
-        )
-        .expect("BufferRing");
-        // SAFETY: ring 在 proactor 之前 unregister；CQE 间 ring 持续存活。
-        unsafe {
-            proactor
-                .submit_recv_multishot_bundle(fd, ring.bgid(), UserData::new(OpKind::Recv, 0))
-                .unwrap();
-        }
-
-        let mut received = Vec::with_capacity(expected.len());
-        let mut layout = Vec::<(u16, usize)>::new();
-        let mut saw_bundle = false;
-        let mut ended = false;
-        for _ in 0..32 {
-            if ended {
-                break;
-            }
-            proactor.submit_and_wait(1).unwrap();
-            proactor.drain_completions(|c| {
-                assert_eq!(c.user_data.kind(), Some(OpKind::Recv));
-                let Some(bid) = c.buffer_id() else {
-                    assert!(!c.has_more());
-                    ended = true;
-                    return;
-                };
-                let n = c.to_result().unwrap();
-                ring.bundle_layout(bid, n, &mut layout).unwrap();
-                saw_bundle |= layout.len() > 1;
-                for &(bid, n) in &layout {
-                    received.extend_from_slice(&ring.buffer(bid)[..n]);
-                }
-                for &(bid, _) in &layout {
-                    ring.recycle(bid);
-                }
-            });
-        }
-
-        assert_eq!(received, expected);
-        assert!(
-            saw_bundle,
-            "kernel should return at least one multi-buffer CQE"
-        );
         ring.unregister(&mut proactor).unwrap();
         server.join().unwrap();
     }

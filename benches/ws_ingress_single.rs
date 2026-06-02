@@ -1,5 +1,5 @@
 // ws_ingress_single —— 1 条 WS conn，server 用尽全力 push，量 client 端
-// max sustained ingress rate + 帧间投递 jitter。
+// max sustained ingress rate + client-thread CPU/frame。
 //
 // ## 这层 bench 在测什么
 //
@@ -114,7 +114,7 @@ mod linux_impl {
         let sq_poll_cpu: u32 = common::arg_or("--sq-poll-cpu", 5);
         let tokio_cpu: usize = common::arg_or("--tokio-cpu", 2);
         let spin_iters: usize = common::arg_or("--spin-iters", 256);
-        let sample_every: u64 = common::arg_or("--sample-every", 1);
+        let sample_every: u64 = common::arg_or("--sample-every", 0);
         let buf_size: u32 = common::arg_or("--buf-size", 4096);
         let buf_entries: u16 = common::arg_or("--buf-entries", 256);
 
@@ -127,7 +127,7 @@ mod linux_impl {
         eprintln!(" talaris   : user→CPU {talaris_cpu}, SQ_POLL→CPU {sq_poll_cpu}");
         eprintln!(" tokio     : worker→CPU {tokio_cpu}");
         eprintln!(" spin_iters: {spin_iters}");
-        eprintln!(" samples   : every {sample_every} frame(s), 0 disables");
+        eprintln!(" samples   : every {sample_every} frame(s), 0 disables diagnostic jitter hist");
         eprintln!(
             " buf_ring  : {buf_entries} × {buf_size}B = {} KiB pool",
             (u32::from(buf_entries) * buf_size) / 1024
@@ -246,17 +246,18 @@ mod linux_impl {
             "cpu ns/frame is client-thread CPU only; SQ_POLL kernel thread CPU is not included."
         );
 
-        println!();
-        println!("=== inter-arrival latency (delivery jitter) ===");
-        common::print_comparison(&[
-            ("talaris Pool.pump", &talaris.inter_arrival),
-            ("talaris pump_data", &talaris_data.inter_arrival),
-            ("talaris data spin", &talaris_data_spin.inter_arrival),
-            ("tokio", &tokio.inter_arrival),
-        ]);
-        println!();
-        println!("(inter-arrival = 用户回调拿到相邻两帧之间的 ns 间隔；");
-        println!(" loopback 上自然双峰：chunk 内 ~ns 级，chunk 间 ~µs 级)");
+        if sample_every > 0 {
+            println!();
+            println!("=== diagnostic inter-arrival latency ===");
+            common::print_comparison(&[
+                ("talaris Pool.pump", &talaris.inter_arrival),
+                ("talaris pump_data", &talaris_data.inter_arrival),
+                ("talaris data spin", &talaris_data_spin.inter_arrival),
+                ("tokio", &tokio.inter_arrival),
+            ]);
+            println!();
+            println!("inter-arrival is diagnostic only; it is not used for IO-model ROI.");
+        }
     }
 
     /// 一个 variant 一个 fresh tokio stream server。

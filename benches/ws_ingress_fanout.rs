@@ -105,6 +105,7 @@ mod linux_impl {
         let talaris_cpu: usize = common::arg_or("--talaris-cpu", 1);
         let sq_poll_cpu: u32 = common::arg_or("--sq-poll-cpu", 5);
         let tokio_cpu: usize = common::arg_or("--tokio-cpu", 2);
+        let sample_every: u64 = common::arg_or("--sample-every", 0);
         let n_list: String = common::arg_or("--n-list", "1,4,16,64".to_string());
         let ns: Vec<u32> = n_list
             .split(',')
@@ -120,6 +121,7 @@ mod linux_impl {
         eprintln!(" server-cpu: {server_cpu}");
         eprintln!(" talaris   : user→CPU {talaris_cpu}, SQ_POLL→CPU {sq_poll_cpu}");
         eprintln!(" tokio     : worker→CPU {tokio_cpu}");
+        eprintln!(" samples   : every {sample_every} frame(s), 0 disables diagnostic jitter hist");
         eprintln!();
 
         let frames_per_chunk = common::frames_per_chunk(payload);
@@ -142,12 +144,20 @@ mod linux_impl {
 
             eprintln!("[N={n}] variant 1/2: talaris");
             let talaris = with_fresh_server(server_cpu, n, chunk_buf.clone(), |addr| {
-                run_talaris(addr, n, stop, payload, talaris_cpu, sq_poll_cpu)
+                run_talaris(
+                    addr,
+                    n,
+                    stop,
+                    payload,
+                    talaris_cpu,
+                    sq_poll_cpu,
+                    sample_every,
+                )
             });
 
             eprintln!("[N={n}] variant 2/2: tokio");
             let tokio = with_fresh_server(server_cpu, n, chunk_buf.clone(), |addr| {
-                run_tokio(addr, n, stop, payload, tokio_cpu)
+                run_tokio(addr, n, stop, payload, tokio_cpu, sample_every)
             });
 
             rows.push(Row { n, talaris, tokio });
@@ -192,15 +202,18 @@ mod linux_impl {
             "cpu ns/frame is client-thread CPU only; SQ_POLL kernel thread CPU is not included."
         );
 
-        println!();
-        println!("=== inter-arrival latency (delivery jitter, aggregate over N conns) ===");
-        for r in &rows {
+        if sample_every > 0 {
             println!();
-            println!("[N={}]", r.n);
-            common::print_comparison(&[
-                ("talaris", &r.talaris.inter_arrival),
-                ("tokio", &r.tokio.inter_arrival),
-            ]);
+            println!("=== diagnostic inter-arrival latency (aggregate over N conns) ===");
+            for r in &rows {
+                println!();
+                println!("[N={}]", r.n);
+                common::print_comparison(&[
+                    ("talaris", &r.talaris.inter_arrival),
+                    ("tokio", &r.tokio.inter_arrival),
+                ]);
+            }
+            println!("inter-arrival is diagnostic only; it is not used for IO-model ROI.");
         }
     }
 
@@ -225,6 +238,7 @@ mod linux_impl {
         payload: usize,
         user_cpu: usize,
         sq_poll_cpu: u32,
+        sample_every: u64,
     ) -> Outcome {
         let _guard = PinGuard::pin("talaris", user_cpu);
 
@@ -249,7 +263,7 @@ mod linux_impl {
             connect_start.elapsed()
         );
 
-        let mut arrivals: Vec<Instant> = Vec::with_capacity(stop.cap_hint());
+        let mut arrivals = common::sampled_arrivals(stop, sample_every);
         let mut frame_count = 0_u64;
         let cpu_timer = common::ThreadCpuTimer::start();
         let bench_start = Instant::now();
@@ -259,8 +273,8 @@ mod linux_impl {
             pool.pump(|_h, ev| {
                 if let WsEvent::Binary(data) = ev {
                     debug_assert_eq!(data.len(), payload);
-                    arrivals.push(Instant::now());
                     frame_count += 1;
+                    common::record_sampled_arrival(&mut arrivals, frame_count, sample_every);
                 }
             })
             .expect("pump");
@@ -304,6 +318,7 @@ mod linux_impl {
         stop: StopMode,
         payload: usize,
         user_cpu: usize,
+        sample_every: u64,
     ) -> Outcome {
         let _guard = PinGuard::pin("tokio", user_cpu);
 
@@ -343,6 +358,7 @@ mod linux_impl {
                         leftover,
                         per_conn_stop,
                         payload,
+                        sample_every,
                         bench_start,
                     )
                     .await;
@@ -370,7 +386,9 @@ mod linux_impl {
 
             // merge N 条 conn 的 arrivals 后按时间排序，inter-arrival 才是"用户
             // 应用层"角度的真实 delivery jitter（不是单条 conn 内的）。
-            all_arrivals.sort_unstable();
+            if sample_every > 0 {
+                all_arrivals.sort_unstable();
+            }
             let inter_arrival = common::inter_arrival_hist(&all_arrivals);
             Outcome {
                 frames: total_count,

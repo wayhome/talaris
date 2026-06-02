@@ -666,8 +666,8 @@ pub async fn tokio_ws_upgrade_client(
     }
 }
 
-/// 在 tokio 端收 WS Binary 帧的 recv loop。每收一帧 push 一个 Instant 到
-/// `arrivals`，给 inter-arrival histogram 用。
+/// 在 tokio 端收 WS Binary 帧的 recv loop。`sample_every > 0` 时采样
+/// `arrivals`，给 diagnostic inter-arrival histogram 用。
 ///
 /// `initial_leftover` 是 upgrade 阶段顺手读到的 WS payload bytes（loopback 上
 /// 这里能有几千字节），必须从这里开始 parse 才不丢帧。
@@ -679,12 +679,13 @@ pub async fn tokio_recv_ws_binary_frames(
     initial_leftover: Vec<u8>,
     stop: StopMode,
     expected_payload: usize,
+    sample_every: u64,
     bench_start: Instant,
 ) -> (Vec<Instant>, u64) {
     use talaris::ws::frame::parse_header;
     use tokio::io::AsyncReadExt;
 
-    let mut arrivals: Vec<Instant> = Vec::with_capacity(stop.cap_hint());
+    let mut arrivals = sampled_arrivals(stop, sample_every);
     let mut frame_count = 0_u64;
 
     let mut recv_buf = vec![0_u8; 256 * 1024];
@@ -706,8 +707,8 @@ pub async fn tokio_recv_ws_binary_frames(
                         break;
                     }
                     debug_assert_eq!(hdr.payload_len as usize, expected_payload);
-                    arrivals.push(Instant::now());
                     frame_count += 1;
+                    record_sampled_arrival(&mut arrivals, frame_count, sample_every);
                     pos += total;
                     if !stop.keep_going(frame_count, bench_start) {
                         leftover.drain(..pos);

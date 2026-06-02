@@ -71,7 +71,7 @@ mod linux_impl {
         let sq_poll_cpu: u32 = common::arg_or("--sq-poll-cpu", 5);
         let sq_poll_idle_ms: u32 = common::arg_or("--sq-poll-idle-ms", 10_000);
         let tokio_cpu: usize = common::arg_or("--tokio-cpu", 2);
-        let sample_every: u64 = common::arg_or("--sample-every", 1);
+        let sample_every: u64 = common::arg_or("--sample-every", 0);
         let buf_size: u32 = common::arg_or("--buf-size", 8192);
         let buf_entries: u16 = common::arg_or("--buf-entries", 256);
 
@@ -93,7 +93,7 @@ mod linux_impl {
             " talaris   : user->CPU {talaris_cpu}, SQ_POLL->CPU {sq_poll_cpu}, idle={sq_poll_idle_ms}ms"
         );
         eprintln!(" tokio     : worker->CPU {tokio_cpu}");
-        eprintln!(" samples   : every {sample_every} frame(s), 0 disables");
+        eprintln!(" samples   : every {sample_every} frame(s), 0 disables diagnostic jitter hist");
         eprintln!(
             " buf_ring  : {buf_entries} x {buf_size}B = {} KiB pool",
             (u32::from(buf_entries) * buf_size) / 1024
@@ -196,18 +196,16 @@ mod linux_impl {
             "checksum guard        : {}",
             talaris_json.checksum ^ tokio_json.checksum
         );
-        println!();
-        println!("=== inter-arrival latency (sampled delivery jitter) ===");
-        common::print_comparison(&[
-            ("talaris text", &talaris_text.inter_arrival),
-            ("talaris + json", &talaris_json.inter_arrival),
-            ("tokio text", &tokio_text.inter_arrival),
-            ("tokio + json", &tokio_json.inter_arrival),
-        ]);
-        if sample_every != 1 {
-            println!(
-                "sampled intervals are diagnostic only; use --sample-every 1 for adjacent-frame jitter."
-            );
+        if sample_every > 0 {
+            println!();
+            println!("=== diagnostic inter-arrival latency ===");
+            common::print_comparison(&[
+                ("talaris text", &talaris_text.inter_arrival),
+                ("talaris + json", &talaris_json.inter_arrival),
+                ("tokio text", &tokio_text.inter_arrival),
+                ("tokio + json", &tokio_json.inter_arrival),
+            ]);
+            println!("inter-arrival is diagnostic only; it is not used for IO-model ROI.");
         }
         println!();
         println!(

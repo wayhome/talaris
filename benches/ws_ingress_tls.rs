@@ -72,7 +72,7 @@ mod linux_impl {
         let sq_poll_idle_ms: u32 = common::arg_or("--sq-poll-idle-ms", 10_000);
         let tokio_cpu: usize = common::arg_or("--tokio-cpu", 2);
         let spin_iters: usize = common::arg_or("--spin-iters", 256);
-        let sample_every: u64 = common::arg_or("--sample-every", 1);
+        let sample_every: u64 = common::arg_or("--sample-every", 0);
         let buf_size: u32 = common::arg_or("--buf-size", 8192);
         let buf_entries: u16 = common::arg_or("--buf-entries", 256);
         let ingress_stats: bool = common::arg_or("--ingress-stats", false);
@@ -88,7 +88,7 @@ mod linux_impl {
         );
         eprintln!(" tokio     : worker->CPU {tokio_cpu}");
         eprintln!(" spin_iters: {spin_iters}");
-        eprintln!(" samples   : every {sample_every} frame(s), 0 disables");
+        eprintln!(" samples   : every {sample_every} frame(s), 0 disables diagnostic jitter hist");
         eprintln!(
             " buf_ring  : {buf_entries} x {buf_size}B = {} KiB pool",
             (u32::from(buf_entries) * buf_size) / 1024
@@ -224,20 +224,18 @@ mod linux_impl {
             print_ingress_stats("talaris data spin", talaris_spin.ingress_stats);
         }
 
-        println!();
-        println!("=== inter-arrival latency (delivery jitter) ===");
-        common::print_comparison(&[
-            ("talaris pump_data", &talaris.inter_arrival),
-            ("talaris data spin", &talaris_spin.inter_arrival),
-            ("tokio + rustls + WS", &tokio_ws.inter_arrival),
-            ("tokio bare lower bound", &tokio_bare.inter_arrival),
-            ("tokio unbuffered bare", &tokio_unbuffered.inter_arrival),
-            ("tokio kTLS ceiling", &tokio_ktls.inter_arrival),
-        ]);
-        if sample_every != 1 {
-            println!(
-                "sampled intervals are diagnostic only; use --sample-every 1 for adjacent-frame jitter."
-            );
+        if sample_every > 0 {
+            println!();
+            println!("=== diagnostic inter-arrival latency ===");
+            common::print_comparison(&[
+                ("talaris pump_data", &talaris.inter_arrival),
+                ("talaris data spin", &talaris_spin.inter_arrival),
+                ("tokio + rustls + WS", &tokio_ws.inter_arrival),
+                ("tokio bare lower bound", &tokio_bare.inter_arrival),
+                ("tokio unbuffered bare", &tokio_unbuffered.inter_arrival),
+                ("tokio kTLS ceiling", &tokio_ktls.inter_arrival),
+            ]);
+            println!("inter-arrival is diagnostic only; it is not used for IO-model ROI.");
         }
     }
 

@@ -71,7 +71,7 @@ mod linux_impl {
     use hdrhistogram::Histogram;
     use talaris::connection::{ConnectionConfig, State};
     use talaris::ws::Event as WsEvent;
-    use talaris::{ConnHandle, Pool, PoolConfig};
+    use talaris::{ConnHandle, Pool};
 
     use super::common;
     use super::common::{PinGuard, StopMode};
@@ -106,6 +106,7 @@ mod linux_impl {
         let sq_poll_cpu: u32 = common::arg_or("--sq-poll-cpu", 5);
         let tokio_cpu: usize = common::arg_or("--tokio-cpu", 2);
         let sample_every: u64 = common::arg_or("--sample-every", 0);
+        let tune = common::TalarisTuneConfig::from_args(4096, 256);
         let n_list: String = common::arg_or("--n-list", "1,4,16,64".to_string());
         let ns: Vec<u32> = n_list
             .split(',')
@@ -122,6 +123,7 @@ mod linux_impl {
         eprintln!(" talaris   : user→CPU {talaris_cpu}, SQ_POLL→CPU {sq_poll_cpu}");
         eprintln!(" tokio     : worker→CPU {tokio_cpu}");
         eprintln!(" samples   : every {sample_every} frame(s), 0 disables diagnostic jitter hist");
+        tune.print_stderr(" ");
         eprintln!();
 
         let frames_per_chunk = common::frames_per_chunk(payload);
@@ -151,6 +153,7 @@ mod linux_impl {
                     payload,
                     talaris_cpu,
                     sq_poll_cpu,
+                    tune,
                     sample_every,
                 )
             });
@@ -238,14 +241,17 @@ mod linux_impl {
         payload: usize,
         user_cpu: usize,
         sq_poll_cpu: u32,
+        tune: common::TalarisTuneConfig,
         sample_every: u64,
     ) -> Outcome {
         let _guard = PinGuard::pin("talaris", user_cpu);
 
-        let cfg_template = ConnectionConfig::new("localhost", addr.port(), "/")
-            .with_tls(false)
-            .with_sq_poll(10_000, Some(sq_poll_cpu));
-        let mut pool = Pool::new(PoolConfig::new(cfg_template.proactor)).expect("pool");
+        let cfg_template = tune.apply_connection(
+            ConnectionConfig::new("localhost", addr.port(), "/")
+                .with_tls(false)
+                .with_sq_poll(10_000, Some(sq_poll_cpu)),
+        );
+        let mut pool = Pool::new(tune.pool_config(cfg_template.proactor)).expect("pool");
 
         // 顺序 connect N 条（Pool::pump 不 sync_ws_open_state → 非阻塞并发
         // handshake 走不通；等 lib 修）。

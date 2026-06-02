@@ -35,6 +35,18 @@ use crate::cursor_buf::CursorBuf;
 use crate::http::{HttpError, parse_response};
 use thiserror::Error;
 
+/// 默认单条 message 最大长度（fragmented 累计）：8 MiB。
+pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
+
+/// 默认单帧 payload 上限：16 MiB。
+pub const DEFAULT_MAX_FRAME_PAYLOAD: u64 = 16 * 1024 * 1024;
+
+/// `WsClient` outbound mask key pool 字节数。
+///
+/// 这是内联数组大小，当前不是运行时调参项；公开该常量便于 bench/report
+/// 把不可调的底层结构也纳入参数表。
+pub const MASK_POOL_BYTES: usize = 256;
+
 /// Configuration
 #[derive(Debug, Clone)]
 pub struct WsConfig {
@@ -46,6 +58,15 @@ pub struct WsConfig {
     pub max_message_size: usize,
     /// 单帧 payload 上限，默认 16 MiB
     pub max_frame_payload: u64,
+    /// `recv_buf` 初始容量。`None` 表示 `max_message_size + MAX_HEADER_LEN`。
+    ///
+    /// 这只是初始 heap capacity，不是协议上限；真实 message 上限仍由
+    /// [`Self::max_message_size`] 控制。
+    pub initial_recv_buffer_capacity: Option<usize>,
+    /// fragmented message assembly buffer 初始容量。`None` 表示 `max_message_size`。
+    pub initial_message_buffer_capacity: Option<usize>,
+    /// outbound `tx_buf` 初始容量。`None` 表示 `max_message_size + MAX_HEADER_LEN`。
+    pub initial_tx_buffer_capacity: Option<usize>,
     /// 收到 Ping 时自动回 Pong（默认 true）
     pub auto_pong: bool,
 }
@@ -58,10 +79,62 @@ impl WsConfig {
             path: path.into(),
             subprotocols: Vec::new(),
             origin: None,
-            max_message_size: 8 * 1024 * 1024,
-            max_frame_payload: 16 * 1024 * 1024,
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            max_frame_payload: DEFAULT_MAX_FRAME_PAYLOAD,
+            initial_recv_buffer_capacity: None,
+            initial_message_buffer_capacity: None,
+            initial_tx_buffer_capacity: None,
             auto_pong: true,
         }
+    }
+
+    #[must_use]
+    pub const fn with_max_message_size(mut self, bytes: usize) -> Self {
+        self.max_message_size = bytes;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_max_frame_payload(mut self, bytes: u64) -> Self {
+        self.max_frame_payload = bytes;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_initial_recv_buffer_capacity(mut self, bytes: usize) -> Self {
+        self.initial_recv_buffer_capacity = Some(bytes);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_initial_message_buffer_capacity(mut self, bytes: usize) -> Self {
+        self.initial_message_buffer_capacity = Some(bytes);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_initial_tx_buffer_capacity(mut self, bytes: usize) -> Self {
+        self.initial_tx_buffer_capacity = Some(bytes);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_initial_buffer_capacities(
+        mut self,
+        recv_bytes: usize,
+        message_bytes: usize,
+        tx_bytes: usize,
+    ) -> Self {
+        self.initial_recv_buffer_capacity = Some(recv_bytes);
+        self.initial_message_buffer_capacity = Some(message_bytes);
+        self.initial_tx_buffer_capacity = Some(tx_bytes);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_auto_pong(mut self, on: bool) -> Self {
+        self.auto_pong = on;
+        self
     }
 }
 
@@ -191,18 +264,23 @@ pub struct WsClient {
     mask_rng: ring::rand::SystemRandom,
 }
 
-/// 一次 refill 装 64 个 mask key（256 字节）。refill 频率取决于 outbound frame
-/// 数量：每 64 帧最多调用一次 SystemRandom。数组内联在 `WsClient` 里，无堆分配。
-const MASK_POOL_BYTES: usize = 256;
-
 impl WsClient {
     /// 构造，但不发 handshake——调 [`begin_handshake`](Self::begin_handshake)
     pub fn new_client(config: WsConfig) -> Result<Self, WsError> {
         use ring::rand::SecureRandom;
 
         let key = generate_key()?;
-        let cap_msg = config.max_message_size;
-        let cap_io = cap_msg + MAX_HEADER_LEN;
+        let default_msg_cap = config.max_message_size;
+        let default_io_cap = default_msg_cap
+            .checked_add(MAX_HEADER_LEN)
+            .ok_or(WsError::Protocol("max_message_size overflow"))?;
+        let recv_cap = config
+            .initial_recv_buffer_capacity
+            .unwrap_or(default_io_cap);
+        let msg_cap = config
+            .initial_message_buffer_capacity
+            .unwrap_or(default_msg_cap);
+        let tx_cap = config.initial_tx_buffer_capacity.unwrap_or(default_io_cap);
         let mask_rng = ring::rand::SystemRandom::new();
         let mut mask_pool = [0_u8; MASK_POOL_BYTES];
         mask_rng
@@ -211,15 +289,15 @@ impl WsClient {
         Ok(Self {
             state: ConnState::Connecting,
             parser: FrameParser::new(),
-            recv_buf: CursorBuf::with_capacity(cap_io),
-            msg_buf: Vec::with_capacity(cap_msg),
+            recv_buf: CursorBuf::with_capacity(recv_cap),
+            msg_buf: Vec::with_capacity(msg_cap),
             borrowed_payload: None,
             msg_opcode: None,
             ctl_buf: [0; 125],
             ctl_len: 0,
             cur_opcode: None,
             cur_fin: false,
-            tx_buf: Vec::with_capacity(cap_io),
+            tx_buf: Vec::with_capacity(tx_cap),
             tx_head: 0,
             config,
             client_key: key,

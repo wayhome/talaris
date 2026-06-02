@@ -69,9 +69,9 @@ mod linux_impl {
     use futures_util::StreamExt;
     use hdrhistogram::Histogram;
     use serde_json::Value;
+    use talaris::Pool;
     use talaris::connection::{ConnectionConfig, State};
     use talaris::ws::DataEvent as WsDataEvent;
-    use talaris::{Pool, PoolConfig};
     use tokio_tungstenite::tungstenite::protocol::Message;
     use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
@@ -100,8 +100,7 @@ mod linux_impl {
         sq_poll_cpu: u32,
         spin_iters: usize,
         talaris_pump: TalarisPumpMode,
-        buf_size: u32,
-        buf_entries: u16,
+        tune: common::TalarisTuneConfig,
     }
 
     #[derive(Debug)]
@@ -318,8 +317,7 @@ mod linux_impl {
             let spin_iters: usize = common::arg_or("--spin-iters", 256);
             let talaris_pump =
                 TalarisPumpMode::from_arg(&common::arg_or("--talaris-pump", "spin".to_owned()));
-            let buf_size: u32 = common::arg_or("--buf-size", 8192);
-            let buf_entries: u16 = common::arg_or("--buf-entries", 256);
+            let tune = common::TalarisTuneConfig::from_args(8192, 256);
             let host: String = common::arg_or("--host", DEFAULT_HOST.to_owned());
             let symbols_csv: String = common::arg_or("--symbols", DEFAULT_SYMBOLS.to_owned());
             let depth_speed: String = common::arg_or("--depth-speed", "100ms".to_owned());
@@ -345,8 +343,7 @@ mod linux_impl {
                 sq_poll_cpu,
                 spin_iters,
                 talaris_pump,
-                buf_size,
-                buf_entries,
+                tune,
             }
         }
 
@@ -356,11 +353,6 @@ mod linux_impl {
             assert!(
                 self.start_timeout_seconds > 0.0,
                 "--start-timeout-seconds must be > 0"
-            );
-            assert!(self.buf_size > 0, "--buf-size must be > 0");
-            assert!(
-                self.buf_entries > 0 && self.buf_entries.is_power_of_two(),
-                "--buf-entries must be a non-zero power of two"
             );
         }
 
@@ -463,14 +455,16 @@ mod linux_impl {
         ready_tx: mpsc::Sender<WorkerEvent>,
     ) -> BenchResult<Outcome> {
         let _guard = PinGuard::pin("binance-futures-talaris", cfg.talaris_cpu);
-        let base = ConnectionConfig::new(&cfg.host, 443, cfg.public_path.clone())
-            .with_sq_poll(10_000, Some(cfg.sq_poll_cpu))
-            .with_buf_ring(cfg.buf_size, cfg.buf_entries);
-        let mut pool = Pool::new(PoolConfig::new(base.proactor))?;
+        let base = cfg.tune.apply_connection(
+            ConnectionConfig::new(&cfg.host, 443, cfg.public_path.clone())
+                .with_sq_poll(10_000, Some(cfg.sq_poll_cpu)),
+        );
+        let mut pool = Pool::new(cfg.tune.pool_config(base.proactor))?;
         let public = pool.connect_blocking(base)?;
-        let market_cfg = ConnectionConfig::new(&cfg.host, 443, cfg.market_path.clone())
-            .with_sq_poll(10_000, Some(cfg.sq_poll_cpu))
-            .with_buf_ring(cfg.buf_size, cfg.buf_entries);
+        let market_cfg = cfg.tune.apply_connection(
+            ConnectionConfig::new(&cfg.host, 443, cfg.market_path.clone())
+                .with_sq_poll(10_000, Some(cfg.sq_poll_cpu)),
+        );
         let market = pool.connect_blocking(market_cfg)?;
         assert_eq!(pool.state(public), Some(State::Open));
         assert_eq!(pool.state(market), Some(State::Open));
@@ -769,12 +763,7 @@ mod linux_impl {
         eprintln!(" tokio       : user->CPU {}", cfg.tokio_cpu);
         eprintln!(" talaris pump: {}", cfg.talaris_pump.label());
         eprintln!(" spin_iters  : {}", cfg.spin_iters);
-        eprintln!(
-            " buf_ring    : {} x {}B = {} KiB pool/conn",
-            cfg.buf_entries,
-            cfg.buf_size,
-            (u32::from(cfg.buf_entries) * cfg.buf_size) / 1024
-        );
+        cfg.tune.print_stderr(" ");
         eprintln!();
     }
 

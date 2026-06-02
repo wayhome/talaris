@@ -83,9 +83,9 @@ mod linux_impl {
     use std::time::{Duration, Instant};
 
     use hdrhistogram::Histogram;
+    use talaris::Pool;
     use talaris::connection::{ConnectionConfig, State};
     use talaris::ws::{DataEvent as WsDataEvent, Event as WsEvent};
-    use talaris::{Pool, PoolConfig};
 
     use super::common;
     use super::common::{PinGuard, StopMode};
@@ -115,8 +115,7 @@ mod linux_impl {
         let tokio_cpu: usize = common::arg_or("--tokio-cpu", 2);
         let spin_iters: usize = common::arg_or("--spin-iters", 256);
         let sample_every: u64 = common::arg_or("--sample-every", 0);
-        let buf_size: u32 = common::arg_or("--buf-size", 4096);
-        let buf_entries: u16 = common::arg_or("--buf-entries", 256);
+        let tune = common::TalarisTuneConfig::from_args(4096, 256);
 
         eprintln!("=========================================================");
         eprintln!(" ws_ingress_single — 1 conn server push → client drain");
@@ -128,10 +127,7 @@ mod linux_impl {
         eprintln!(" tokio     : worker→CPU {tokio_cpu}");
         eprintln!(" spin_iters: {spin_iters}");
         eprintln!(" samples   : every {sample_every} frame(s), 0 disables diagnostic jitter hist");
-        eprintln!(
-            " buf_ring  : {buf_entries} × {buf_size}B = {} KiB pool",
-            (u32::from(buf_entries) * buf_size) / 1024
-        );
+        tune.print_stderr(" ");
         eprintln!(" execution : 串行，inline on main thread，每 variant 之间 unpin");
         eprintln!();
 
@@ -159,8 +155,7 @@ mod linux_impl {
                 payload,
                 talaris_cpu,
                 sq_poll_cpu,
-                buf_size,
-                buf_entries,
+                tune,
                 sample_every,
             )
         });
@@ -175,8 +170,7 @@ mod linux_impl {
                 payload,
                 talaris_cpu,
                 sq_poll_cpu,
-                buf_size,
-                buf_entries,
+                tune,
                 sample_every,
             )
         });
@@ -192,8 +186,7 @@ mod linux_impl {
                 talaris_cpu,
                 sq_poll_cpu,
                 spin_iters,
-                buf_size,
-                buf_entries,
+                tune,
                 sample_every,
             )
         });
@@ -281,18 +274,18 @@ mod linux_impl {
         payload: usize,
         user_cpu: usize,
         sq_poll_cpu: u32,
-        buf_size: u32,
-        buf_entries: u16,
+        tune: common::TalarisTuneConfig,
         sample_every: u64,
     ) -> Outcome {
         let _guard = PinGuard::pin("talaris", user_cpu);
         eprintln!("[talaris] user→CPU {user_cpu}, SQ_POLL kthread→CPU {sq_poll_cpu}");
 
-        let cfg = ConnectionConfig::new("localhost", addr.port(), "/")
-            .with_tls(false)
-            .with_sq_poll(10_000, Some(sq_poll_cpu))
-            .with_buf_ring(buf_size, buf_entries);
-        let mut pool = Pool::new(PoolConfig::new(cfg.proactor)).expect("pool");
+        let cfg = tune.apply_connection(
+            ConnectionConfig::new("localhost", addr.port(), "/")
+                .with_tls(false)
+                .with_sq_poll(10_000, Some(sq_poll_cpu)),
+        );
+        let mut pool = Pool::new(tune.pool_config(cfg.proactor)).expect("pool");
         let h = pool.connect_blocking_to(cfg, addr).expect("connect");
         assert_eq!(pool.state(h), Some(State::Open));
 
@@ -346,18 +339,18 @@ mod linux_impl {
         payload: usize,
         user_cpu: usize,
         sq_poll_cpu: u32,
-        buf_size: u32,
-        buf_entries: u16,
+        tune: common::TalarisTuneConfig,
         sample_every: u64,
     ) -> Outcome {
         let _guard = PinGuard::pin("talaris-data", user_cpu);
         eprintln!("[talaris-data] user→CPU {user_cpu}, SQ_POLL kthread→CPU {sq_poll_cpu}");
 
-        let cfg = ConnectionConfig::new("localhost", addr.port(), "/")
-            .with_tls(false)
-            .with_sq_poll(10_000, Some(sq_poll_cpu))
-            .with_buf_ring(buf_size, buf_entries);
-        let mut pool = Pool::new(PoolConfig::new(cfg.proactor)).expect("pool");
+        let cfg = tune.apply_connection(
+            ConnectionConfig::new("localhost", addr.port(), "/")
+                .with_tls(false)
+                .with_sq_poll(10_000, Some(sq_poll_cpu)),
+        );
+        let mut pool = Pool::new(tune.pool_config(cfg.proactor)).expect("pool");
         let h = pool.connect_blocking_to(cfg, addr).expect("connect");
         assert_eq!(pool.state(h), Some(State::Open));
 
@@ -414,8 +407,7 @@ mod linux_impl {
         user_cpu: usize,
         sq_poll_cpu: u32,
         spin_iters: usize,
-        buf_size: u32,
-        buf_entries: u16,
+        tune: common::TalarisTuneConfig,
         sample_every: u64,
     ) -> Outcome {
         let _guard = PinGuard::pin("talaris-data-spin", user_cpu);
@@ -423,11 +415,12 @@ mod linux_impl {
             "[talaris-data-spin] user→CPU {user_cpu}, SQ_POLL kthread→CPU {sq_poll_cpu}, spin_iters={spin_iters}"
         );
 
-        let cfg = ConnectionConfig::new("localhost", addr.port(), "/")
-            .with_tls(false)
-            .with_sq_poll(10_000, Some(sq_poll_cpu))
-            .with_buf_ring(buf_size, buf_entries);
-        let mut pool = Pool::new(PoolConfig::new(cfg.proactor)).expect("pool");
+        let cfg = tune.apply_connection(
+            ConnectionConfig::new("localhost", addr.port(), "/")
+                .with_tls(false)
+                .with_sq_poll(10_000, Some(sq_poll_cpu)),
+        );
+        let mut pool = Pool::new(tune.pool_config(cfg.proactor)).expect("pool");
         let h = pool.connect_blocking_to(cfg, addr).expect("connect");
         assert_eq!(pool.state(h), Some(State::Open));
 

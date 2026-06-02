@@ -88,10 +88,17 @@ impl ConnectionState {
             None
         };
 
-        let ws_cfg = WsConfig::new(cfg.host.clone(), cfg.path.clone());
+        let mut ws_cfg = cfg
+            .ws_config
+            .clone()
+            .unwrap_or_else(|| WsConfig::new(cfg.host.clone(), cfg.path.clone()));
+        ws_cfg.host.clone_from(&cfg.host);
+        ws_cfg.path.clone_from(&cfg.path);
         let ws = WsClient::new_client(ws_cfg)?;
 
         let init_cap = cfg.buf_ring_slot_size as usize;
+        let send_cap = cfg.send_buffer_initial_capacity.unwrap_or(init_cap);
+        let tls_pending_out_cap = cfg.tls_pending_out_initial_capacity.unwrap_or(init_cap);
         Ok(Self {
             socket,
             addr: sock_addr,
@@ -99,9 +106,9 @@ impl ConnectionState {
             ws,
             state: State::Init,
             buf_ring: None,
-            send_buf: Vec::with_capacity(init_cap),
+            send_buf: Vec::with_capacity(send_cap),
             send_head: 0,
-            tls_pending_out: Vec::with_capacity(init_cap),
+            tls_pending_out: Vec::with_capacity(tls_pending_out_cap),
             send_inflight: false,
             multishot_armed: false,
             ws_handshake_begun: false,

@@ -50,9 +50,9 @@ mod linux_impl {
     use std::time::{Duration, Instant};
 
     use hdrhistogram::Histogram;
+    use talaris::Pool;
     use talaris::connection::{ConnectionConfig, State};
     use talaris::ws::DataEvent as WsDataEvent;
-    use talaris::{Pool, PoolConfig};
 
     use super::common;
     use super::common::PinGuard;
@@ -117,8 +117,7 @@ mod linux_impl {
         let user_cpu: usize = common::arg_or("--user-cpu", 1);
         let sq_poll_cpu: u32 = common::arg_or("--sq-poll-cpu", 5);
         let spin_iters: usize = common::arg_or("--spin-iters", 256);
-        let buf_size: u32 = common::arg_or("--buf-size", 8192);
-        let buf_entries: u16 = common::arg_or("--buf-entries", 256);
+        let tune = common::TalarisTuneConfig::from_args(8192, 256);
         let symbols_csv: String = common::arg_or("--symbols", DEFAULT_SYMBOLS.to_owned());
 
         assert!(seconds > 0.0, "--seconds must be > 0");
@@ -138,17 +137,15 @@ mod linux_impl {
         eprintln!(" measure     : {seconds:.3}s");
         eprintln!(" talaris     : user->CPU {user_cpu}, SQ_POLL->CPU {sq_poll_cpu}");
         eprintln!(" spin_iters  : {spin_iters}");
-        eprintln!(
-            " buf_ring    : {buf_entries} x {buf_size}B = {} KiB pool",
-            (u32::from(buf_entries) * buf_size) / 1024
-        );
+        tune.print_stderr(" ");
         eprintln!();
 
         let _guard = PinGuard::pin("binance-live", user_cpu);
-        let cfg = ConnectionConfig::new("stream.binance.com", 443, "/ws")
-            .with_sq_poll(10_000, Some(sq_poll_cpu))
-            .with_buf_ring(buf_size, buf_entries);
-        let mut pool = Pool::new(PoolConfig::new(cfg.proactor)).expect("pool");
+        let cfg = tune.apply_connection(
+            ConnectionConfig::new("stream.binance.com", 443, "/ws")
+                .with_sq_poll(10_000, Some(sq_poll_cpu)),
+        );
+        let mut pool = Pool::new(tune.pool_config(cfg.proactor)).expect("pool");
         let handle = pool.connect_blocking(cfg).expect("connect Binance WSS");
         assert_eq!(pool.state(handle), Some(State::Open));
         eprintln!("[binance] connected; sending one SUBSCRIBE request");

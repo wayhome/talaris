@@ -26,6 +26,180 @@
 use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
+use talaris::connection::ConnectionConfig;
+use talaris::proactor::ProactorConfig;
+use talaris::{PoolConfig, ws};
+
+// ─── Talaris low-level tuning knobs ───────────────────────────────────
+
+#[derive(Debug, Clone, Copy)]
+pub struct TalarisTuneConfig {
+    pub proactor_entries: u32,
+    pub buf_size: u32,
+    pub buf_entries: u16,
+    pub pool_conn_capacity: usize,
+    pub completion_batch_capacity: usize,
+    pub send_buffer_capacity: usize,
+    pub tls_pending_out_capacity: usize,
+    pub ws_max_message_size: usize,
+    pub ws_max_frame_payload: u64,
+    pub ws_recv_buffer_capacity: usize,
+    pub ws_message_buffer_capacity: usize,
+    pub ws_tx_buffer_capacity: usize,
+}
+
+impl TalarisTuneConfig {
+    pub fn from_args(default_buf_size: u32, default_buf_entries: u16) -> Self {
+        let cfg = Self {
+            proactor_entries: arg_or("--proactor-entries", 0),
+            buf_size: arg_or("--buf-size", default_buf_size),
+            buf_entries: arg_or("--buf-entries", default_buf_entries),
+            pool_conn_capacity: arg_or("--pool-conn-cap", 0),
+            completion_batch_capacity: arg_or("--completion-batch-cap", 0),
+            send_buffer_capacity: arg_or("--send-buf-cap", 0),
+            tls_pending_out_capacity: arg_or("--tls-pending-out-cap", 0),
+            ws_max_message_size: arg_or("--ws-max-message-size", 0),
+            ws_max_frame_payload: arg_or("--ws-max-frame-payload", 0),
+            ws_recv_buffer_capacity: arg_or("--ws-recv-buf-cap", 0),
+            ws_message_buffer_capacity: arg_or("--ws-msg-buf-cap", 0),
+            ws_tx_buffer_capacity: arg_or("--ws-tx-buf-cap", 0),
+        };
+        cfg.validate();
+        cfg
+    }
+
+    pub fn validate(&self) {
+        assert!(self.buf_size > 0, "--buf-size must be > 0");
+        assert!(
+            self.buf_entries > 0 && self.buf_entries.is_power_of_two(),
+            "--buf-entries must be a non-zero power of two"
+        );
+        assert!(
+            self.proactor_entries == 0 || self.proactor_entries.is_power_of_two(),
+            "--proactor-entries must be 0 or a power of two"
+        );
+    }
+
+    pub fn apply_connection(self, mut cfg: ConnectionConfig) -> ConnectionConfig {
+        cfg = cfg.with_buf_ring(self.buf_size, self.buf_entries);
+        if self.proactor_entries != 0 {
+            cfg = cfg.with_proactor_entries(self.proactor_entries);
+        }
+        if self.send_buffer_capacity != 0 {
+            cfg = cfg.with_send_buffer_capacity(self.send_buffer_capacity);
+        }
+        if self.tls_pending_out_capacity != 0 {
+            cfg = cfg.with_tls_pending_out_capacity(self.tls_pending_out_capacity);
+        }
+        if self.ws_max_message_size != 0 || self.ws_max_frame_payload != 0 {
+            cfg = cfg.with_ws_limits(
+                nonzero_or(self.ws_max_message_size, ws::DEFAULT_MAX_MESSAGE_SIZE),
+                nonzero_or_u64(self.ws_max_frame_payload, ws::DEFAULT_MAX_FRAME_PAYLOAD),
+            );
+        }
+        if self.ws_recv_buffer_capacity != 0 {
+            cfg = cfg.with_ws_recv_buffer_capacity(self.ws_recv_buffer_capacity);
+        }
+        if self.ws_message_buffer_capacity != 0 {
+            cfg = cfg.with_ws_message_buffer_capacity(self.ws_message_buffer_capacity);
+        }
+        if self.ws_tx_buffer_capacity != 0 {
+            cfg = cfg.with_ws_tx_buffer_capacity(self.ws_tx_buffer_capacity);
+        }
+        cfg
+    }
+
+    pub const fn pool_config(self, mut proactor: ProactorConfig) -> PoolConfig {
+        if self.proactor_entries != 0 {
+            proactor.entries = self.proactor_entries;
+        }
+        let mut cfg = PoolConfig::new(proactor);
+        if self.pool_conn_capacity != 0 {
+            cfg = cfg.with_initial_conn_capacity(self.pool_conn_capacity);
+        }
+        if self.completion_batch_capacity != 0 {
+            cfg = cfg.with_completion_batch_capacity(self.completion_batch_capacity);
+        }
+        cfg
+    }
+
+    pub fn print_stderr(self, indent: &str) {
+        eprintln!(
+            "{indent}proactor   : entries={}",
+            override_or_default_u32(self.proactor_entries, ProactorConfig::default().entries)
+        );
+        eprintln!(
+            "{indent}buf_ring   : {} x {}B = {} KiB pool/conn",
+            self.buf_entries,
+            self.buf_size,
+            (u32::from(self.buf_entries) * self.buf_size) / 1024
+        );
+        eprintln!(
+            "{indent}pool       : conn_cap={}, completion_batch_cap={}",
+            override_or_default(
+                self.pool_conn_capacity,
+                talaris::DEFAULT_POOL_INITIAL_CONN_CAPACITY
+            ),
+            override_or_default(
+                self.completion_batch_capacity,
+                talaris::DEFAULT_POOL_COMPLETION_BATCH_CAPACITY
+            )
+        );
+        eprintln!(
+            "{indent}conn bufs  : send={}, tls_pending_out={}",
+            override_or_default(self.send_buffer_capacity, self.buf_size as usize),
+            override_or_default(self.tls_pending_out_capacity, self.buf_size as usize)
+        );
+        eprintln!(
+            "{indent}ws limits  : max_msg={}, max_frame={}, mask_pool={}B",
+            override_or_default(self.ws_max_message_size, ws::DEFAULT_MAX_MESSAGE_SIZE),
+            override_or_default_u64(self.ws_max_frame_payload, ws::DEFAULT_MAX_FRAME_PAYLOAD),
+            ws::MASK_POOL_BYTES
+        );
+        let ws_default_io = ws::DEFAULT_MAX_MESSAGE_SIZE + ws::MAX_HEADER_LEN;
+        eprintln!(
+            "{indent}ws bufs    : recv={}, msg={}, tx={}",
+            override_or_default(self.ws_recv_buffer_capacity, ws_default_io),
+            override_or_default(
+                self.ws_message_buffer_capacity,
+                ws::DEFAULT_MAX_MESSAGE_SIZE
+            ),
+            override_or_default(self.ws_tx_buffer_capacity, ws_default_io)
+        );
+    }
+}
+
+const fn nonzero_or(value: usize, default: usize) -> usize {
+    if value == 0 { default } else { value }
+}
+
+const fn nonzero_or_u64(value: u64, default: u64) -> u64 {
+    if value == 0 { default } else { value }
+}
+
+fn override_or_default(value: usize, default: usize) -> String {
+    if value == 0 {
+        format!("default({default})")
+    } else {
+        value.to_string()
+    }
+}
+
+fn override_or_default_u32(value: u32, default: u32) -> String {
+    if value == 0 {
+        format!("default({default})")
+    } else {
+        value.to_string()
+    }
+}
+
+fn override_or_default_u64(value: u64, default: u64) -> String {
+    if value == 0 {
+        format!("default({default})")
+    } else {
+        value.to_string()
+    }
+}
 
 // ─── HdrHistogram ──────────────────────────────────────────────────────
 

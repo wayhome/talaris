@@ -18,6 +18,9 @@ pub mod handshake;
 pub mod mask;
 pub mod parser;
 
-pub use client::{ConnState, DataEvent, Event, WsClient, WsConfig, WsError};
+pub use client::{
+    ConnState, DEFAULT_MAX_FRAME_PAYLOAD, DEFAULT_MAX_MESSAGE_SIZE, DataEvent, Event,
+    MASK_POOL_BYTES, WsClient, WsConfig, WsError,
+};
 pub use close::CloseCode;
 pub use frame::{FrameError, FrameHeader, MAX_HEADER_LEN, OpCode};

@@ -38,9 +38,9 @@ mod linux_impl {
     use std::time::{Duration, Instant};
 
     use hdrhistogram::Histogram;
+    use talaris::Pool;
     use talaris::connection::{ConnectionConfig, State};
     use talaris::ws::DataEvent as WsDataEvent;
-    use talaris::{Pool, PoolConfig};
 
     use super::common;
     use super::common::{PinGuard, StopMode, ThreadCpuTimer};
@@ -72,8 +72,7 @@ mod linux_impl {
         let sq_poll_idle_ms: u32 = common::arg_or("--sq-poll-idle-ms", 10_000);
         let tokio_cpu: usize = common::arg_or("--tokio-cpu", 2);
         let sample_every: u64 = common::arg_or("--sample-every", 0);
-        let buf_size: u32 = common::arg_or("--buf-size", 8192);
-        let buf_entries: u16 = common::arg_or("--buf-entries", 256);
+        let tune = common::TalarisTuneConfig::from_args(8192, 256);
 
         let json_payload = common::json_quote_payload(target_payload);
         let payload = json_payload.len();
@@ -94,10 +93,7 @@ mod linux_impl {
         );
         eprintln!(" tokio     : worker->CPU {tokio_cpu}");
         eprintln!(" samples   : every {sample_every} frame(s), 0 disables diagnostic jitter hist");
-        eprintln!(
-            " buf_ring  : {buf_entries} x {buf_size}B = {} KiB pool",
-            (u32::from(buf_entries) * buf_size) / 1024
-        );
+        tune.print_stderr(" ");
         eprintln!(
             "[bench] pre-encoded text chunk: {} frames x {}B = {} KiB total",
             frames_per_chunk,
@@ -115,8 +111,7 @@ mod linux_impl {
                 talaris_cpu,
                 sq_poll_cpu,
                 sq_poll_idle_ms,
-                buf_size,
-                buf_entries,
+                tune,
                 sample_every,
                 false,
             )
@@ -132,8 +127,7 @@ mod linux_impl {
                 talaris_cpu,
                 sq_poll_cpu,
                 sq_poll_idle_ms,
-                buf_size,
-                buf_entries,
+                tune,
                 sample_every,
                 true,
             )
@@ -235,8 +229,7 @@ mod linux_impl {
         user_cpu: usize,
         sq_poll_cpu: u32,
         sq_poll_idle_ms: u32,
-        buf_size: u32,
-        buf_entries: u16,
+        tune: common::TalarisTuneConfig,
         sample_every: u64,
         decode_json: bool,
     ) -> Outcome {
@@ -247,15 +240,14 @@ mod linux_impl {
         };
         let _guard = PinGuard::pin(label, user_cpu);
 
-        let cfg = ConnectionConfig::new("localhost", addr.port(), "/")
-            .with_tls(false)
-            .with_buf_ring(buf_size, buf_entries);
+        let cfg = tune
+            .apply_connection(ConnectionConfig::new("localhost", addr.port(), "/").with_tls(false));
         let cfg = if sq_poll_idle_ms == 0 {
             cfg
         } else {
             cfg.with_sq_poll(sq_poll_idle_ms, Some(sq_poll_cpu))
         };
-        let mut pool = Pool::new(PoolConfig::new(cfg.proactor)).expect("pool");
+        let mut pool = Pool::new(tune.pool_config(cfg.proactor)).expect("pool");
         let h = pool.connect_blocking_to(cfg, addr).expect("connect");
         assert_eq!(pool.state(h), Some(State::Open));
 

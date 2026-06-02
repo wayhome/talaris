@@ -56,7 +56,10 @@ pub(crate) mod cursor_buf;
 
 pub(crate) mod connection_state;
 
-pub use pool::{ConnHandle, Pool, PoolConfig};
+pub use pool::{
+    ConnHandle, DEFAULT_POOL_COMPLETION_BATCH_CAPACITY, DEFAULT_POOL_INITIAL_CONN_CAPACITY, Pool,
+    PoolConfig,
+};
 
 #[cfg(test)]
 pub(crate) mod test_helpers;

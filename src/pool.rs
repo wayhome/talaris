@@ -43,25 +43,51 @@ use crate::ws::{ConnState as WsConnState, DataEvent as WsDataEvent, Event as WsE
 /// 远超任何实际场景。bits 55..28 预留给 op-seq dedup（v1 不使用）。
 const CONN_ID_MASK: u64 = 0x0FFF_FFFF;
 
+/// Pool slot table 默认初始容量。0 表示按 `Vec` 默认策略延迟分配。
+pub const DEFAULT_POOL_INITIAL_CONN_CAPACITY: usize = 0;
+
+/// 每轮 pump drain CQE 的暂存 `Vec<Completion>` 默认初始容量。
+pub const DEFAULT_POOL_COMPLETION_BATCH_CAPACITY: usize = 16;
+
 /// Pool 构造参数。透传 [`ProactorConfig`]，conn 自身参数走
 /// [`Pool::connect_blocking`] 时传 [`ConnectionConfig`]。
 #[derive(Debug, Clone, Copy)]
 pub struct PoolConfig {
     pub proactor: ProactorConfig,
+    /// `conns` slot table 初始容量。高 fanout bench 可设为目标连接数，避免
+    /// 逐条 connect 时 slot table grow。
+    pub initial_conn_capacity: usize,
+    /// `pump_impl` drain CQE 暂存区初始容量。高 fanout / burst 场景可增大，
+    /// 避免第一轮大 batch grow。
+    pub completion_batch_capacity: usize,
 }
 
 impl PoolConfig {
     #[must_use]
     pub const fn new(proactor: ProactorConfig) -> Self {
-        Self { proactor }
+        Self {
+            proactor,
+            initial_conn_capacity: DEFAULT_POOL_INITIAL_CONN_CAPACITY,
+            completion_batch_capacity: DEFAULT_POOL_COMPLETION_BATCH_CAPACITY,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_initial_conn_capacity(mut self, capacity: usize) -> Self {
+        self.initial_conn_capacity = capacity;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_completion_batch_capacity(mut self, capacity: usize) -> Self {
+        self.completion_batch_capacity = capacity;
+        self
     }
 }
 
 impl Default for PoolConfig {
     fn default() -> Self {
-        Self {
-            proactor: ProactorConfig::default(),
-        }
+        Self::new(ProactorConfig::default())
     }
 }
 
@@ -104,7 +130,8 @@ impl std::fmt::Debug for Pool {
         f.debug_struct("Pool")
             .field("proactor", &self.proactor)
             .field("active_count", &self.active_count)
-            .field("slot_capacity", &self.conns.len())
+            .field("slot_len", &self.conns.len())
+            .field("slot_capacity", &self.conns.capacity())
             .field("next_conn_id", &self.next_conn_id)
             .field("next_bgid", &self.next_bgid)
             .finish()
@@ -116,11 +143,11 @@ impl Pool {
         let proactor = Proactor::new(cfg.proactor)?;
         Ok(Self {
             proactor,
-            conns: Vec::new(),
+            conns: Vec::with_capacity(cfg.initial_conn_capacity),
             active_count: 0,
             next_conn_id: 0,
             next_bgid: 0,
-            completions_buf: Vec::with_capacity(16),
+            completions_buf: Vec::with_capacity(cfg.completion_batch_capacity),
             _not_send: PhantomData,
         })
     }

@@ -15,7 +15,7 @@ use thiserror::Error;
 
 use crate::proactor::{BufferRingError, ProactorConfig, ProactorError};
 use crate::tls::TlsError;
-use crate::ws::WsError;
+use crate::ws::{WsConfig, WsError};
 
 /// 调优点：如果 entries 太小，用户态还没 recycle，kernel 又要写数据，就可能撞 ENOBUFS；如果 buf_size 太小，大 payload 会被切成更多 CQE；如果 buf_size 太大，内存/cache 压力会上来，小行情包不一定划算
 ///
@@ -129,6 +129,17 @@ pub struct ConnectionConfig {
     /// buffer ring entry 数。必须非零 2 的幂。`entries × buf_size` = 整池字节数；
     /// 太小会让 multishot 在 user space recycle 跟不上时频繁 ENOBUFS。
     pub buf_ring_entries: u16,
+    /// 覆盖底层 [`WsClient`](crate::ws::WsClient) 配置。`host` / `path` 最终仍以
+    /// 当前 `ConnectionConfig` 为准，避免 transport endpoint 和 WS handshake
+    /// header 被调参配置意外改散。
+    pub ws_config: Option<WsConfig>,
+    /// `send_buf` 初始容量。`None` 表示沿用 `buf_ring_slot_size`。
+    ///
+    /// 这是 socket/TLS outbound staging buffer；真实 pending 字节仍会按需 grow。
+    pub send_buffer_initial_capacity: Option<usize>,
+    /// TLS in-flight 期间延迟合入 `send_buf` 的密文 staging buffer 初始容量。
+    /// `None` 表示沿用 `buf_ring_slot_size`。
+    pub tls_pending_out_initial_capacity: Option<usize>,
     /// 收集 [`IngressStats`]。默认关闭，避免在生产 hot path 上无条件更新计数器。
     pub track_ingress_stats: bool,
 }
@@ -147,6 +158,9 @@ impl ConnectionConfig {
             bgid: 0,
             buf_ring_slot_size: DEFAULT_BUF_RING_SLOT_SIZE,
             buf_ring_entries: DEFAULT_BUF_RING_ENTRIES,
+            ws_config: None,
+            send_buffer_initial_capacity: None,
+            tls_pending_out_initial_capacity: None,
             track_ingress_stats: false,
         }
     }
@@ -170,6 +184,20 @@ impl ConnectionConfig {
     pub const fn with_sq_poll(mut self, idle_ms: u32, cpu: Option<u32>) -> Self {
         self.proactor.sq_poll_idle_ms = Some(idle_ms);
         self.proactor.sq_poll_cpu = cpu;
+        self
+    }
+
+    /// 覆盖 proactor 完整配置。适合统一注入 entries / SQ_POLL / CPU pinning。
+    #[must_use]
+    pub const fn with_proactor(mut self, proactor: ProactorConfig) -> Self {
+        self.proactor = proactor;
+        self
+    }
+
+    /// 覆盖 io_uring SQ entries。必须是 2 的幂；最终校验由 io_uring init 完成。
+    #[must_use]
+    pub const fn with_proactor_entries(mut self, entries: u32) -> Self {
+        self.proactor.entries = entries;
         self
     }
 
@@ -201,6 +229,122 @@ impl ConnectionConfig {
         self.buf_ring_entries = entries;
         self
     }
+
+    /// 覆盖底层 WebSocket 配置。`host` / `path` 会在连接建立时被当前
+    /// `ConnectionConfig` 的 endpoint 覆盖，只保留 buffer / limit / protocol
+    /// 等调优字段。
+    #[must_use]
+    pub fn with_ws_config(mut self, config: WsConfig) -> Self {
+        self.ws_config = Some(config);
+        self
+    }
+
+    /// 覆盖 WebSocket protocol limits。
+    #[must_use]
+    pub fn with_ws_limits(mut self, max_message_size: usize, max_frame_payload: u64) -> Self {
+        let mut config = self
+            .ws_config
+            .take()
+            .unwrap_or_else(|| WsConfig::new(self.host.clone(), self.path.clone()));
+        config.max_message_size = max_message_size;
+        config.max_frame_payload = max_frame_payload;
+        self.ws_config = Some(config);
+        self
+    }
+
+    /// 覆盖 WebSocket `recv_buf` 初始容量。
+    #[must_use]
+    pub fn with_ws_recv_buffer_capacity(mut self, bytes: usize) -> Self {
+        let mut config = self
+            .ws_config
+            .take()
+            .unwrap_or_else(|| WsConfig::new(self.host.clone(), self.path.clone()));
+        config.initial_recv_buffer_capacity = Some(bytes);
+        self.ws_config = Some(config);
+        self
+    }
+
+    /// 覆盖 WebSocket fragmented message assembly buffer 初始容量。
+    #[must_use]
+    pub fn with_ws_message_buffer_capacity(mut self, bytes: usize) -> Self {
+        let mut config = self
+            .ws_config
+            .take()
+            .unwrap_or_else(|| WsConfig::new(self.host.clone(), self.path.clone()));
+        config.initial_message_buffer_capacity = Some(bytes);
+        self.ws_config = Some(config);
+        self
+    }
+
+    /// 覆盖 WebSocket outbound `tx_buf` 初始容量。
+    #[must_use]
+    pub fn with_ws_tx_buffer_capacity(mut self, bytes: usize) -> Self {
+        let mut config = self
+            .ws_config
+            .take()
+            .unwrap_or_else(|| WsConfig::new(self.host.clone(), self.path.clone()));
+        config.initial_tx_buffer_capacity = Some(bytes);
+        self.ws_config = Some(config);
+        self
+    }
+
+    /// 一次性覆盖 WebSocket 三个 hot-path heap buffer 的初始容量。
+    #[must_use]
+    pub fn with_ws_buffer_capacities(
+        mut self,
+        recv_bytes: usize,
+        message_bytes: usize,
+        tx_bytes: usize,
+    ) -> Self {
+        let mut config = self
+            .ws_config
+            .take()
+            .unwrap_or_else(|| WsConfig::new(self.host.clone(), self.path.clone()));
+        config.initial_recv_buffer_capacity = Some(recv_bytes);
+        config.initial_message_buffer_capacity = Some(message_bytes);
+        config.initial_tx_buffer_capacity = Some(tx_bytes);
+        self.ws_config = Some(config);
+        self
+    }
+
+    /// 控制收到 Ping 时是否自动排 Pong。默认开启。
+    #[must_use]
+    pub fn with_auto_pong(mut self, on: bool) -> Self {
+        let mut config = self
+            .ws_config
+            .take()
+            .unwrap_or_else(|| WsConfig::new(self.host.clone(), self.path.clone()));
+        config.auto_pong = on;
+        self.ws_config = Some(config);
+        self
+    }
+
+    /// 覆盖 socket/TLS outbound staging buffer 初始容量。
+    #[must_use]
+    pub const fn with_send_buffer_capacity(mut self, bytes: usize) -> Self {
+        self.send_buffer_initial_capacity = Some(bytes);
+        self
+    }
+
+    /// 覆盖 TLS in-flight 密文 staging buffer 初始容量。
+    #[must_use]
+    pub const fn with_tls_pending_out_capacity(mut self, bytes: usize) -> Self {
+        self.tls_pending_out_initial_capacity = Some(bytes);
+        self
+    }
+
+    /// 一次性覆盖连接层两个 outbound staging buffer 的初始容量。
+    #[must_use]
+    pub const fn with_connection_buffer_capacities(
+        mut self,
+        send_bytes: usize,
+        tls_pending_out_bytes: usize,
+    ) -> Self {
+        self.send_buffer_initial_capacity = Some(send_bytes);
+        self.tls_pending_out_initial_capacity = Some(tls_pending_out_bytes);
+        self
+    }
+
     /// 启用或关闭 ingress CQE 调优统计。生产连接默认关闭。
     #[must_use]
     pub const fn with_ingress_stats(mut self, on: bool) -> Self {

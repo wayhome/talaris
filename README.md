@@ -302,6 +302,12 @@ re-arm，但 burst 头几帧延迟会受影响）。
 详细见 `benches/proactor_overhead.rs` 注释里的数据 —— SQ_POLL 在 Nop bench 里
 实际是负优化，这是设计本性，不是 bug。
 
+### `with_ingress_stats(true)` —— 临时量化 recv CQE
+
+默认关闭。调 buf ring 时可临时开启，并通过 `pool.ingress_stats(h)` 读取
+`recv_data_cqes`、`recv_bytes` 和 `recv_ring_exhaustions`。生产连接保持关闭，避免
+在 hot path 上更新计数器。
+
 ### `pin_current_thread_to(cpu)` —— 砍尾抖动
 
 `isolcpus=N-M` 把 CPU 从普通 scheduler 摘出来 + 钉线程到那个 CPU = 主要砍 p99 / max
@@ -452,7 +458,7 @@ Tested on Linux 6.x with io_uring features: `SETUP_SQPOLL`,
 | `ws_ingress_raw` | 绕开 Pool + WsClient, 直接 Proactor + BufferRing 收 Binary 帧 |
 | `ws_ingress_single` | Pool.pump vs Pool.pump_data vs tokio (单 conn, 稳态满速) |
 | `ws_ingress_fanout` | N ∈ {1,4,16,64} 条 conn 同时收 (talaris Pool 路由 vs tokio N task) |
-| `ws_ingress_tls` | loopback WSS：talaris、fair tokio rustls + 同一 WsClient、tokio bare 下界、软件 kTLS ceiling probe |
+| `ws_ingress_tls` | loopback WSS：talaris、fair tokio rustls + 同一 WsClient、tokio bare 下界、rustls unbuffered probe、软件 kTLS probe |
 | `binance_live` | Binance Spot 公共 WSS 实盘 TLS ingress：多 symbol 高频 Text JSON 行情 |
 
 跑法：
@@ -465,6 +471,11 @@ taskset -c 0-7 cargo bench --bench ws_ingress_tls -- \
     --server-cpu 4 --talaris-cpu 1 --sq-poll-cpu 3 --tokio-cpu 2 \
     --spin-iters 256 --buf-size 4096 --buf-entries 256
 
+taskset -c 0-7 cargo bench --bench ws_ingress_tls -- \
+    --frames 10000000 --payload 256 --sample-every 0 \
+    --server-cpu 4 --talaris-cpu 1 --sq-poll-cpu 3 --tokio-cpu 2 \
+    --spin-iters 256 --buf-size 4096 --buf-entries 256 --ingress-stats true
+
 taskset -c 0-7 cargo bench --bench binance_live -- \
     --seconds 30 --warmup-seconds 5 --user-cpu 1 --sq-poll-cpu 3
 ```
@@ -476,6 +487,23 @@ taskset -c 0-7 cargo bench --bench binance_live -- \
 Linux 软件 kTLS 组只用于判断 ceiling，不是生产 transport 路径。kTLS RX 的 control
 record 必须经 `recvmsg` ancillary data 处理；完整生产实现还要处理 TLS 1.3 KeyUpdate
 和 session ticket。是否值得引入这条复杂路径，必须先在部署机器上跑 probe。
+
+### TLS ingress batching 实验结论
+
+东京测试机 Linux 6.17、256 B payload、`4 KiB × 256` buf ring 的 1000 万帧统计：
+普通 multishot recv 已达到约 `3.87 KiB/CQE`，`ENOBUFS=0`。扩大到
+`16 KiB × 256` 后约 `13.1 KiB/CQE`，但 5000 万帧长跑没有稳定吞吐收益，说明 CQE
+路由不是当前 TLS hot path 的主要瓶颈。
+
+Linux 6.10+ `IORING_RECVSEND_BUNDLE` 也做过原型验证，但内核会无上限地合并当前
+可用 provided buffers。本机观察到平均约 `134-217 slots/CQE`，即
+`0.55-0.89 MiB/CQE`，吞吐和交付粒度都变差，因此没有保留生产开关。rustls
+unbuffered API 也保留为 benchmark-only probe；当前稳态不优于 buffered 路径。
+
+后续若继续做 TLS ingress batching，应验证“有界、record-aware staging”：目标接近
+单条 TLS record，而不是把 socket backlog 无界合并。相关上游语义见
+[io-uring 6.10 bundle 说明](https://github.com/axboe/liburing/wiki/What%27s-new-with-io_uring-in-6.10)
+和 [rustls unbuffered state machine](https://github.com/rustls/rustls/blob/main/rustls/src/conn/unbuffered.rs)。
 
 实测数据见 `src/connection.rs::ConnectionConfig::with_buf_ring` 的 doc。
 

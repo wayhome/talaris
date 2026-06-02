@@ -34,7 +34,7 @@
 use std::marker::PhantomData;
 use std::net::{SocketAddr, ToSocketAddrs};
 
-use crate::connection::{ConnectionConfig, ConnectionError, State};
+use crate::connection::{ConnectionConfig, ConnectionError, IngressStats, State};
 use crate::connection_state::ConnectionState;
 use crate::proactor::{Completion, Proactor, ProactorConfig, ProactorError};
 use crate::ws::{ConnState as WsConnState, DataEvent as WsDataEvent, Event as WsEvent};
@@ -607,6 +607,15 @@ impl Pool {
     #[must_use]
     pub fn conn_count(&self) -> usize {
         self.active_count as usize
+    }
+
+    /// Returns opt-in ingress diagnostics for a live connection.
+    #[must_use]
+    pub fn ingress_stats(&self, h: ConnHandle) -> Option<IngressStats> {
+        self.conns
+            .get(h.0 as usize)
+            .and_then(Option::as_ref)
+            .map(ConnectionState::ingress_stats)
     }
 
     fn conn_mut(&mut self, h: ConnHandle) -> Result<&mut ConnectionState, ConnectionError> {

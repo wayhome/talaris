@@ -85,6 +85,21 @@ pub enum ConnectionError {
     IdSpaceExhausted(&'static str),
 }
 
+/// Opt-in ingress diagnostics. Disabled by default so production hot paths do not
+/// pay for counters unless a caller explicitly enables them for tuning.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct IngressStats {
+    /// Positive-length recv data CQEs handled by this connection.
+    pub recv_data_cqes: u64,
+    /// Ciphertext bytes carried by those CQEs.
+    pub recv_bytes: u64,
+    /// Provided-buffer slots consumed. Greater than `recv_data_cqes` only when recv
+    /// bundle is enabled and the kernel returns a multi-buffer CQE.
+    pub recv_slots: u64,
+    /// Multishot recv terminations caused by provided-buffer ring exhaustion.
+    pub recv_ring_exhaustions: u64,
+}
+
 /// 构造单条 conn 的参数。`proactor` 是创建 [`Pool`](crate::Pool) 时的便利默认值；
 /// 单条 connect 实际使用 Pool 已持有的 proactor，`conn_id` / `bgid` 也由
 /// [`Pool`](crate::Pool) 内部分配，caller 不应自己设。
@@ -118,6 +133,8 @@ pub struct ConnectionConfig {
     ///
     /// 默认关闭：这是部署相关调优开关，旧内核不支持，且低流量下未必值得开启。
     pub recv_bundle: bool,
+    /// 收集 [`IngressStats`]。默认关闭，避免在生产 hot path 上无条件更新计数器。
+    pub track_ingress_stats: bool,
 }
 
 impl ConnectionConfig {
@@ -135,6 +152,7 @@ impl ConnectionConfig {
             buf_ring_slot_size: DEFAULT_BUF_RING_SLOT_SIZE,
             buf_ring_entries: DEFAULT_BUF_RING_ENTRIES,
             recv_bundle: false,
+            track_ingress_stats: false,
         }
     }
 
@@ -194,6 +212,13 @@ impl ConnectionConfig {
     #[must_use]
     pub const fn with_recv_bundle(mut self, on: bool) -> Self {
         self.recv_bundle = on;
+        self
+    }
+
+    /// 启用或关闭 ingress CQE 调优统计。生产连接默认关闭。
+    #[must_use]
+    pub const fn with_ingress_stats(mut self, on: bool) -> Self {
+        self.track_ingress_stats = on;
         self
     }
 }

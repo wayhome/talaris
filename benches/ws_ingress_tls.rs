@@ -38,7 +38,7 @@ mod linux_impl {
     use std::time::{Duration, Instant};
 
     use hdrhistogram::Histogram;
-    use talaris::connection::{ConnectionConfig, State};
+    use talaris::connection::{ConnectionConfig, IngressStats, State};
     use talaris::ws::DataEvent as WsDataEvent;
     use talaris::{Pool, PoolConfig};
 
@@ -49,6 +49,7 @@ mod linux_impl {
         frames: u64,
         elapsed: Duration,
         inter_arrival: Histogram<u64>,
+        ingress_stats: Option<IngressStats>,
     }
 
     impl Outcome {
@@ -74,6 +75,7 @@ mod linux_impl {
         let buf_size: u32 = common::arg_or("--buf-size", 8192);
         let buf_entries: u16 = common::arg_or("--buf-entries", 256);
         let recv_bundle: bool = common::arg_or("--recv-bundle", false);
+        let ingress_stats: bool = common::arg_or("--ingress-stats", false);
 
         eprintln!("=========================================================");
         eprintln!(" ws_ingress_tls - loopback WSS TLS ingress");
@@ -92,6 +94,7 @@ mod linux_impl {
             (u32::from(buf_entries) * buf_size) / 1024
         );
         eprintln!(" recv_bundle: {recv_bundle}");
+        eprintln!(" ingress_stats: {ingress_stats}");
         eprintln!();
 
         let frames_per_chunk = common::frames_per_chunk(payload);
@@ -119,6 +122,7 @@ mod linux_impl {
                 buf_size,
                 buf_entries,
                 recv_bundle,
+                ingress_stats,
                 sample_every,
                 None,
             )
@@ -137,6 +141,7 @@ mod linux_impl {
                 buf_size,
                 buf_entries,
                 recv_bundle,
+                ingress_stats,
                 sample_every,
                 Some(spin_iters),
             )
@@ -210,6 +215,12 @@ mod linux_impl {
             "kTLS ceiling vs tokio bare: {:.2}x (probe only)",
             tokio_ktls.frames_per_sec() / tokio_bare.frames_per_sec()
         );
+        if ingress_stats {
+            println!();
+            println!("=== talaris ingress diagnostics ===");
+            print_ingress_stats("talaris pump_data", talaris.ingress_stats);
+            print_ingress_stats("talaris data spin", talaris_spin.ingress_stats);
+        }
 
         println!();
         println!("=== inter-arrival latency (delivery jitter) ===");
@@ -253,6 +264,7 @@ mod linux_impl {
         buf_size: u32,
         buf_entries: u16,
         recv_bundle: bool,
+        ingress_stats: bool,
         sample_every: u64,
         spin_iters: Option<usize>,
     ) -> Outcome {
@@ -266,7 +278,8 @@ mod linux_impl {
         let cfg = ConnectionConfig::new("localhost", addr.port(), "/")
             .with_tls_config(common::local_tls_client_config())
             .with_buf_ring(buf_size, buf_entries)
-            .with_recv_bundle(recv_bundle);
+            .with_recv_bundle(recv_bundle)
+            .with_ingress_stats(ingress_stats);
         let cfg = if sq_poll_idle_ms == 0 {
             cfg
         } else {
@@ -305,6 +318,7 @@ mod linux_impl {
             }
         }
         let elapsed = bench_start.elapsed();
+        let ingress_stats = pool.ingress_stats(h);
         eprintln!(
             "[{label}] {} frames in {:.3}s ({:.0} f/s)",
             frame_count,
@@ -318,6 +332,7 @@ mod linux_impl {
             frames: frame_count,
             elapsed,
             inter_arrival,
+            ingress_stats,
         }
     }
 
@@ -368,6 +383,7 @@ mod linux_impl {
                 frames: frame_count,
                 elapsed,
                 inter_arrival: common::inter_arrival_hist(&arrivals),
+                ingress_stats: None,
             }
         })
     }
@@ -420,6 +436,7 @@ mod linux_impl {
                 frames: frame_count,
                 elapsed,
                 inter_arrival: common::inter_arrival_hist(&arrivals),
+                ingress_stats: None,
             }
         })
     }
@@ -470,6 +487,7 @@ mod linux_impl {
                 frames: frame_count,
                 elapsed,
                 inter_arrival: common::inter_arrival_hist(&arrivals),
+                ingress_stats: None,
             }
         })
     }
@@ -521,8 +539,22 @@ mod linux_impl {
                 frames: frame_count,
                 elapsed,
                 inter_arrival: common::inter_arrival_hist(&arrivals),
+                ingress_stats: None,
             }
         })
+    }
+
+    fn print_ingress_stats(label: &str, stats: Option<IngressStats>) {
+        let Some(stats) = stats else {
+            return;
+        };
+        let bytes_per_cqe = stats.recv_bytes as f64 / stats.recv_data_cqes.max(1) as f64;
+        let slots_per_cqe = stats.recv_slots as f64 / stats.recv_data_cqes.max(1) as f64;
+        println!(
+            "{label:<22} | cqes={:>10} | bytes/cqe={bytes_per_cqe:>8.1} | slots/cqe={slots_per_cqe:>5.2} | ENOBUFS={}",
+            fmt_int(stats.recv_data_cqes),
+            stats.recv_ring_exhaustions,
+        );
     }
 
     fn fmt_int(n: u64) -> String {

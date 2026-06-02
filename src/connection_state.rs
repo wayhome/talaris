@@ -16,7 +16,7 @@
 use std::io;
 use std::net::SocketAddr;
 
-use crate::connection::{ConnectionConfig, ConnectionError, State};
+use crate::connection::{ConnectionConfig, ConnectionError, IngressStats, State};
 use crate::proactor::{
     BufferRing, Completion, Domain, OpKind, Proactor, SockAddr, SqeFlags, TcpSocket, UserData,
 };
@@ -56,6 +56,7 @@ pub(crate) struct ConnectionState {
     pub(crate) send_inflight: bool,
     pub(crate) multishot_armed: bool,
     pub(crate) ws_handshake_begun: bool,
+    pub(crate) ingress_stats: IngressStats,
     pub(crate) cfg: ConnectionConfig,
 }
 
@@ -97,6 +98,7 @@ impl ConnectionState {
             send_inflight: false,
             multishot_armed: false,
             ws_handshake_begun: false,
+            ingress_stats: IngressStats::default(),
             cfg,
         })
     }
@@ -109,6 +111,11 @@ impl ConnectionState {
     #[inline]
     pub(crate) const fn state(&self) -> State {
         self.state
+    }
+
+    #[inline]
+    pub(crate) const fn ingress_stats(&self) -> IngressStats {
+        self.ingress_stats
     }
 
     pub(crate) fn assert_open(&self) -> Result<(), ConnectionError> {
@@ -329,6 +336,7 @@ impl ConnectionState {
                 }
                 Ok(_) => Ok(()),
                 Err(e) if is_recv_buffer_ring_exhausted(&e) => {
+                    self.record_recv_ring_exhaustion();
                     // ENOBUFS 不是 bug 而是 backpressure 信号：kernel 端 head 追上
                     // 了 ring tail，没空闲 buffer 可分配。两个前提保证下一轮
                     // try_rearm_multishot 不会立刻再 ENOBUFS：
@@ -368,6 +376,7 @@ impl ConnectionState {
     }
 
     fn on_recv_buffer(&mut self, bid: u16, n: usize) -> Result<(), ConnectionError> {
+        self.record_recv_data(n, 1);
         // Raw pointer split borrow（详见 connection.rs 模块文档同名段落）。
         let bytes_ptr = self
             .buf_ring
@@ -399,6 +408,7 @@ impl ConnectionState {
             n,
             &mut self.recv_bundle_layout,
         )?;
+        self.record_recv_data(n, self.recv_bundle_layout.len());
 
         let ring = self.buf_ring.as_ref().expect("buf_ring");
         let chunks = self
@@ -419,6 +429,24 @@ impl ConnectionState {
         }
         self.recv_bundle_layout.clear();
         recv_result
+    }
+
+    #[inline]
+    fn record_recv_data(&mut self, bytes: usize, slots: usize) {
+        if !self.cfg.track_ingress_stats {
+            return;
+        }
+        self.ingress_stats.recv_data_cqes = self.ingress_stats.recv_data_cqes.saturating_add(1);
+        self.ingress_stats.recv_bytes = self.ingress_stats.recv_bytes.saturating_add(bytes as u64);
+        self.ingress_stats.recv_slots = self.ingress_stats.recv_slots.saturating_add(slots as u64);
+    }
+
+    #[inline]
+    fn record_recv_ring_exhaustion(&mut self) {
+        if self.cfg.track_ingress_stats {
+            self.ingress_stats.recv_ring_exhaustions =
+                self.ingress_stats.recv_ring_exhaustions.saturating_add(1);
+        }
     }
 
     /// pump 主循环末尾调一次：WS 内部状态切到 Closed 时，外层 state 同步到

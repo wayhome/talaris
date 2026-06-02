@@ -140,12 +140,13 @@ impl TlsAdapter {
         self.ingest_ciphertext_batch(std::iter::once(src), dst_ciphertext, on_plaintext)
     }
 
-    /// 批量喂入多块 socket ciphertext。`read_tls` 会先尽可能吸收整批输入，再统一
-    /// `process_new_packets`；rustls deframer 满时才提前 process + drain 腾位置。
+    /// 批量喂入多块 socket ciphertext。每次成功 `read_tls` 后仍立即调用
+    /// `process_new_packets`：rustls buffered API 内部以 4 KiB 扩 deframer，并要求
+    /// caller 每次成功 read 后 process。这个入口的收益来自 recv bundle 减少 CQE
+    /// 路由和 WS drain 次数，而不是跨 TLS record 延迟 deframe。
     ///
     /// io_uring recv bundle 会让一个 CQE 对应多个 provided-buffer slice。用这个入口
-    /// 可以减少 incomplete TLS record 上重复调用 `process_new_packets` 的次数，同时
-    /// 保持每块 buffer 零 staging copy。
+    /// 可以在保持每块 buffer 零 staging copy 的同时，一次处理一条 CQE 的全部 slice。
     pub fn ingest_ciphertext_batch<'a, I, F>(
         &mut self,
         chunks: I,
@@ -156,6 +157,7 @@ impl TlsAdapter {
         I: IntoIterator<Item = &'a [u8]>,
         F: FnMut(&[u8]),
     {
+        let mut processed = false;
         for mut src in chunks {
             while !src.is_empty() {
                 if !self.conn.wants_read() {
@@ -172,15 +174,20 @@ impl TlsAdapter {
 
                 let before = src.len();
                 // `read_tls` reads from io::Read into rustls' internal buffer and
-                // advances `src`. Delay packet processing until the whole batch
-                // has been absorbed unless the deframer explicitly needs space.
+                // advances `src`. rustls requires process_new_packets after each
+                // successful read_tls call to bound its deframer buffer.
                 let n = self.conn.read_tls(&mut src)?;
                 if n == 0 || src.len() == before {
                     break;
                 }
+                self.process_and_drain(dst_ciphertext, &mut on_plaintext)?;
+                processed = true;
             }
         }
-        self.process_and_drain(dst_ciphertext, &mut on_plaintext)
+        if !processed {
+            self.process_and_drain(dst_ciphertext, &mut on_plaintext)?;
+        }
+        Ok(())
     }
 
     fn process_and_drain<F>(

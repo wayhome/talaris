@@ -34,6 +34,8 @@ pub(crate) struct ConnectionState {
     pub(crate) state: State,
     /// `None` 直到 TCP connect 完成。drop 前必须 `unregister`（Pool 负责）。
     pub(crate) buf_ring: Option<BufferRing>,
+    /// recv bundle CQE 展开后的 `(bid, readable_len)`。持久复用，避免 hot path alloc。
+    pub(crate) recv_bundle_layout: Vec<(u16, usize)>,
     /// kernel 通过 SQE 持着 `send_buf.as_ptr().add(send_head)` 直到 Send CQE
     /// 回来。**不变式：`send_inflight = true` 期间 `send_buf` 不得 push /
     /// extend，`send_head` 不得移动**（任一操作可能触发 realloc / memmove，
@@ -88,6 +90,7 @@ impl ConnectionState {
             ws,
             state: State::Init,
             buf_ring: None,
+            recv_bundle_layout: Vec::with_capacity(16),
             send_buf: Vec::with_capacity(init_cap),
             send_head: 0,
             tls_pending_out: Vec::with_capacity(init_cap),
@@ -226,15 +229,26 @@ impl ConnectionState {
             return Ok(());
         };
         let bgid = ring.bgid();
-        // SAFETY: buf_ring 持有效 ring 注册；fd 在 self 寿命内有效
-        unsafe {
-            proactor.submit_recv_multishot(
-                self.socket.as_raw_fd(),
-                bgid,
-                UserData::new(OpKind::Recv, u64::from(self.cfg.conn_id)),
-            )?;
-        }
+        self.submit_recv_multishot(proactor, bgid)?;
         self.multishot_armed = true;
+        Ok(())
+    }
+
+    fn submit_recv_multishot(
+        &self,
+        proactor: &mut Proactor,
+        bgid: u16,
+    ) -> Result<(), ConnectionError> {
+        let fd = self.socket.as_raw_fd();
+        let ud = UserData::new(OpKind::Recv, u64::from(self.cfg.conn_id));
+        // SAFETY: buf_ring 持有效 ring 注册；fd 在 self 寿命内有效。
+        unsafe {
+            if self.cfg.recv_bundle {
+                proactor.submit_recv_multishot_bundle(fd, bgid, ud)?;
+            } else {
+                proactor.submit_recv_multishot(fd, bgid, ud)?;
+            }
+        }
         Ok(())
     }
 
@@ -274,14 +288,7 @@ impl ConnectionState {
         )?;
         let bgid = ring.bgid();
         self.buf_ring = Some(ring);
-        // SAFETY: buf_ring 现在 own 了 ring 注册；fd 仍然有效
-        unsafe {
-            proactor.submit_recv_multishot(
-                self.socket.as_raw_fd(),
-                bgid,
-                UserData::new(OpKind::Recv, u64::from(self.cfg.conn_id)),
-            )?;
-        }
+        self.submit_recv_multishot(proactor, bgid)?;
         self.multishot_armed = true;
 
         self.state = if self.tls.is_some() {
@@ -354,6 +361,13 @@ impl ConnectionState {
             return Err(ConnectionError::PeerClosed);
         }
 
+        if self.cfg.recv_bundle {
+            return self.on_recv_bundle(bid, n);
+        }
+        self.on_recv_buffer(bid, n)
+    }
+
+    fn on_recv_buffer(&mut self, bid: u16, n: usize) -> Result<(), ConnectionError> {
         // Raw pointer split borrow（详见 connection.rs 模块文档同名段落）。
         let bytes_ptr = self
             .buf_ring
@@ -365,38 +379,45 @@ impl ConnectionState {
         // 三条保证 bytes 视图在本函数内全程有效（详见 connection.rs 长注释）。
         let bytes: &[u8] = unsafe { std::slice::from_raw_parts(bytes_ptr, n) };
 
-        let recv_result = if let Some(tls) = &mut self.tls {
-            // **不变式**：tls_pending_out 是 in-flight 安全累加器，**绝不 clear**——
-            // 它由 try_submit_send 在 `!send_inflight` 时 drain。这里直接 append
-            // 让 rustls 把 handshake reply / re-key / alert 密文堆进去。
-            let ws = &mut self.ws;
-            tls.ingest_ciphertext(bytes, &mut self.tls_pending_out, |plaintext| {
-                ws.feed_recv(plaintext);
-            })?;
-            if !tls.is_handshaking()
-                && matches!(self.state, State::TlsHandshake)
-                && !self.ws_handshake_begun
-            {
-                // ALPN 校验：通告了 http/1.1 还不够，server 可能忽略；这里 enforce
-                tls.verify_alpn()?;
-                self.state = State::WsHandshake;
-                self.ws.begin_handshake()?;
-                self.ws_handshake_begun = true;
-            }
-            // peer 发了 close_notify → 推 driver 到 Closing。Open 之后再发生
-            // 不应该把 state 拉回 TlsHandshake；只在尚未 Closed 时推一步。
-            if tls.received_close_notify() && !matches!(self.state, State::Closed | State::Closing)
-            {
-                self.state = State::Closing;
-            }
-            Ok(())
-        } else {
-            self.ws.feed_recv(bytes);
-            Ok::<_, ConnectionError>(())
-        };
+        let recv_result = ingest_recv_chunks(
+            self.tls.as_mut(),
+            &mut self.ws,
+            &mut self.state,
+            &mut self.ws_handshake_begun,
+            &mut self.tls_pending_out,
+            std::iter::once(bytes),
+        );
 
         self.buf_ring.as_mut().expect("buf_ring").recycle(bid);
 
+        recv_result
+    }
+
+    fn on_recv_bundle(&mut self, bid: u16, n: usize) -> Result<(), ConnectionError> {
+        self.buf_ring.as_mut().expect("buf_ring").bundle_layout(
+            bid,
+            n,
+            &mut self.recv_bundle_layout,
+        )?;
+
+        let ring = self.buf_ring.as_ref().expect("buf_ring");
+        let chunks = self
+            .recv_bundle_layout
+            .iter()
+            .map(|&(bid, n)| &ring.buffer(bid)[..n]);
+        let recv_result = ingest_recv_chunks(
+            self.tls.as_mut(),
+            &mut self.ws,
+            &mut self.state,
+            &mut self.ws_handshake_begun,
+            &mut self.tls_pending_out,
+            chunks,
+        );
+
+        for &(bid, _) in &self.recv_bundle_layout {
+            self.buf_ring.as_mut().expect("buf_ring").recycle(bid);
+        }
+        self.recv_bundle_layout.clear();
         recv_result
     }
 
@@ -417,6 +438,42 @@ impl ConnectionState {
             self.state = State::Open;
         }
     }
+}
+
+fn ingest_recv_chunks<'a>(
+    tls: Option<&mut TlsAdapter>,
+    ws: &mut WsClient,
+    state: &mut State,
+    ws_handshake_begun: &mut bool,
+    tls_pending_out: &mut Vec<u8>,
+    chunks: impl IntoIterator<Item = &'a [u8]>,
+) -> Result<(), ConnectionError> {
+    let Some(tls) = tls else {
+        for bytes in chunks {
+            ws.feed_recv(bytes);
+        }
+        return Ok(());
+    };
+
+    // **不变式**：tls_pending_out 是 in-flight 安全累加器，**绝不 clear**——
+    // 它由 try_submit_send 在 `!send_inflight` 时 drain。这里直接 append
+    // 让 rustls 把 handshake reply / re-key / alert 密文堆进去。
+    tls.ingest_ciphertext_batch(chunks, tls_pending_out, |plaintext| {
+        ws.feed_recv(plaintext);
+    })?;
+    if !tls.is_handshaking() && matches!(*state, State::TlsHandshake) && !*ws_handshake_begun {
+        // ALPN 校验：通告了 http/1.1 还不够，server 可能忽略；这里 enforce
+        tls.verify_alpn()?;
+        *state = State::WsHandshake;
+        ws.begin_handshake()?;
+        *ws_handshake_begun = true;
+    }
+    // peer 发了 close_notify → 推 driver 到 Closing。Open 之后再发生
+    // 不应该把 state 拉回 TlsHandshake；只在尚未 Closed 时推一步。
+    if tls.received_close_notify() && !matches!(*state, State::Closed | State::Closing) {
+        *state = State::Closing;
+    }
+    Ok(())
 }
 
 fn is_recv_buffer_ring_exhausted(err: &io::Error) -> bool {

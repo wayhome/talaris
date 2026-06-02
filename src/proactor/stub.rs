@@ -181,6 +181,16 @@ impl BufferRing {
         unimplemented!("{STUB_PANIC}")
     }
 
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    pub(crate) fn bundle_layout(
+        &mut self,
+        _first_bid: u16,
+        _total_len: usize,
+        _out: &mut Vec<(u16, usize)>,
+    ) -> Result<(), BufferRingError> {
+        unimplemented!("{STUB_PANIC}")
+    }
+
     pub fn unregister(&mut self, _reactor: &mut Proactor) -> Result<(), BufferRingError> {
         Ok(())
     }
@@ -259,6 +269,8 @@ pub enum ProactorError {
     SqFull,
     #[error("io_uring submit failed: {0}")]
     Submit(#[source] io::Error),
+    #[error("kernel does not support IORING_RECVSEND_BUNDLE (requires Linux 6.10+)")]
+    RecvsendBundleUnsupported,
 }
 
 pub struct Proactor;
@@ -344,6 +356,22 @@ impl Proactor {
         _user_data: UserData,
     ) -> Result<(), ProactorError> {
         unimplemented!("{STUB_PANIC}")
+    }
+
+    /// # Safety
+    /// Stub —— 调用即 panic。
+    pub unsafe fn submit_recv_multishot_bundle(
+        &mut self,
+        _fd: RawFd,
+        _buf_group: u16,
+        _user_data: UserData,
+    ) -> Result<(), ProactorError> {
+        unimplemented!("{STUB_PANIC}")
+    }
+
+    #[must_use]
+    pub const fn supports_recvsend_bundle(&self) -> bool {
+        false
     }
 
     /// # Safety

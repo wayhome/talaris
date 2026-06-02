@@ -113,6 +113,11 @@ pub struct ConnectionConfig {
     /// buffer ring entry 数。必须非零 2 的幂。`entries × buf_size` = 整池字节数；
     /// 太小会让 multishot 在 user space recycle 跟不上时频繁 ENOBUFS。
     pub buf_ring_entries: u16,
+    /// 开启 Linux 6.10+ `IORING_RECVSEND_BUNDLE`。一条 recv CQE 可以消费连续多块
+    /// provided buffer，减少 CQE 数，并让 TLS deframer 更接近按 record 批量处理。
+    ///
+    /// 默认关闭：这是部署相关调优开关，旧内核不支持，且低流量下未必值得开启。
+    pub recv_bundle: bool,
 }
 
 impl ConnectionConfig {
@@ -129,6 +134,7 @@ impl ConnectionConfig {
             bgid: 0,
             buf_ring_slot_size: DEFAULT_BUF_RING_SLOT_SIZE,
             buf_ring_entries: DEFAULT_BUF_RING_ENTRIES,
+            recv_bundle: false,
         }
     }
 
@@ -180,6 +186,14 @@ impl ConnectionConfig {
         );
         self.buf_ring_slot_size = slot_size;
         self.buf_ring_entries = entries;
+        self
+    }
+
+    /// 显式启用或关闭 Linux 6.10+ io_uring recv bundle。启用后，如果当前内核未
+    /// 声明 `IORING_FEAT_RECVSEND_BUNDLE`，connect 会返回 proactor 错误。
+    #[must_use]
+    pub const fn with_recv_bundle(mut self, on: bool) -> Self {
+        self.recv_bundle = on;
         self
     }
 }

@@ -130,42 +130,57 @@ impl TlsAdapter {
     /// staging copy。
     pub fn ingest_ciphertext<F>(
         &mut self,
-        mut src: &[u8],
+        src: &[u8],
         dst_ciphertext: &mut Vec<u8>,
-        mut on_plaintext: F,
+        on_plaintext: F,
     ) -> Result<(), TlsError>
     where
         F: FnMut(&[u8]),
     {
-        let mut processed = false;
-        while !src.is_empty() {
-            if !self.conn.wants_read() {
-                // rustls 的 deframer buffer 满了 —— 先 process_new_packets + drain
-                // 让它腾位置；如果腾完还不想读，说明它确实暂时不需要更多字节
-                // （处于 mid-record / post-close / 已经有完整 record 待处理等
-                // 合法状态）。早期版本在此 return Err，会把合法状态当 fatal
-                // 错误抛出关连接。正确做法：return Ok 让 caller 下一轮再喂。
-                self.process_and_drain(dst_ciphertext, &mut on_plaintext)?;
+        self.ingest_ciphertext_batch(std::iter::once(src), dst_ciphertext, on_plaintext)
+    }
+
+    /// 批量喂入多块 socket ciphertext。`read_tls` 会先尽可能吸收整批输入，再统一
+    /// `process_new_packets`；rustls deframer 满时才提前 process + drain 腾位置。
+    ///
+    /// io_uring recv bundle 会让一个 CQE 对应多个 provided-buffer slice。用这个入口
+    /// 可以减少 incomplete TLS record 上重复调用 `process_new_packets` 的次数，同时
+    /// 保持每块 buffer 零 staging copy。
+    pub fn ingest_ciphertext_batch<'a, I, F>(
+        &mut self,
+        chunks: I,
+        dst_ciphertext: &mut Vec<u8>,
+        mut on_plaintext: F,
+    ) -> Result<(), TlsError>
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+        F: FnMut(&[u8]),
+    {
+        for mut src in chunks {
+            while !src.is_empty() {
                 if !self.conn.wants_read() {
-                    return Ok(());
+                    // rustls 的 deframer buffer 满了 —— 先 process_new_packets + drain
+                    // 让它腾位置；如果腾完还不想读，说明它确实暂时不需要更多字节
+                    // （处于 mid-record / post-close / 已经有完整 record 待处理等
+                    // 合法状态）。早期版本在此 return Err，会把合法状态当 fatal
+                    // 错误抛出关连接。正确做法：return Ok 让 caller 下一轮再喂。
+                    self.process_and_drain(dst_ciphertext, &mut on_plaintext)?;
+                    if !self.conn.wants_read() {
+                        return Ok(());
+                    }
+                }
+
+                let before = src.len();
+                // `read_tls` reads from io::Read into rustls' internal buffer and
+                // advances `src`. Delay packet processing until the whole batch
+                // has been absorbed unless the deframer explicitly needs space.
+                let n = self.conn.read_tls(&mut src)?;
+                if n == 0 || src.len() == before {
+                    break;
                 }
             }
-
-            let before = src.len();
-            // `read_tls` reads from io::Read into rustls' internal buffer and
-            // advances `src`. Process immediately after each socket chunk so a
-            // pending deframer buffer never causes us to drop unread CQE bytes.
-            let n = self.conn.read_tls(&mut src)?;
-            if n == 0 || src.len() == before {
-                break;
-            }
-            self.process_and_drain(dst_ciphertext, &mut on_plaintext)?;
-            processed = true;
         }
-        if !processed {
-            self.process_and_drain(dst_ciphertext, &mut on_plaintext)?;
-        }
-        Ok(())
+        self.process_and_drain(dst_ciphertext, &mut on_plaintext)
     }
 
     fn process_and_drain<F>(

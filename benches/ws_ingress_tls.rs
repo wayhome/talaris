@@ -73,6 +73,7 @@ mod linux_impl {
         let sample_every: u64 = common::arg_or("--sample-every", 1);
         let buf_size: u32 = common::arg_or("--buf-size", 8192);
         let buf_entries: u16 = common::arg_or("--buf-entries", 256);
+        let recv_bundle: bool = common::arg_or("--recv-bundle", false);
 
         eprintln!("=========================================================");
         eprintln!(" ws_ingress_tls - loopback WSS TLS ingress");
@@ -90,6 +91,7 @@ mod linux_impl {
             " buf_ring  : {buf_entries} x {buf_size}B = {} KiB pool",
             (u32::from(buf_entries) * buf_size) / 1024
         );
+        eprintln!(" recv_bundle: {recv_bundle}");
         eprintln!();
 
         let frames_per_chunk = common::frames_per_chunk(payload);
@@ -116,6 +118,7 @@ mod linux_impl {
                 sq_poll_idle_ms,
                 buf_size,
                 buf_entries,
+                recv_bundle,
                 sample_every,
                 None,
             )
@@ -133,6 +136,7 @@ mod linux_impl {
                 sq_poll_idle_ms,
                 buf_size,
                 buf_entries,
+                recv_bundle,
                 sample_every,
                 Some(spin_iters),
             )
@@ -234,6 +238,7 @@ mod linux_impl {
         sq_poll_idle_ms: u32,
         buf_size: u32,
         buf_entries: u16,
+        recv_bundle: bool,
         sample_every: u64,
         spin_iters: Option<usize>,
     ) -> Outcome {
@@ -246,7 +251,8 @@ mod linux_impl {
 
         let cfg = ConnectionConfig::new("localhost", addr.port(), "/")
             .with_tls_config(common::local_tls_client_config())
-            .with_buf_ring(buf_size, buf_entries);
+            .with_buf_ring(buf_size, buf_entries)
+            .with_recv_bundle(recv_bundle);
         let cfg = if sq_poll_idle_ms == 0 {
             cfg
         } else {

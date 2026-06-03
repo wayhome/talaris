@@ -358,6 +358,7 @@ mod linux_impl {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn tokio_recv_ws_text_frames(
         s: &mut tokio::net::TcpStream,
         initial_leftover: Vec<u8>,

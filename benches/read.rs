@@ -43,11 +43,17 @@ mod linux {
 
     pub fn run() {
         let messages = common::arg_or("--messages", 100_000_usize);
+        let chunk_size = common::arg_or("--chunk-size", 4096_usize);
         let mixed = build_mixed_wire(messages);
 
         println!(
-            "read bench: talaris client inbound, tungstenite-style mixed small messages, messages={}, wire={}B",
+            "read bench: talaris client inbound, tungstenite-style mixed small messages, messages={}, chunk_size={}, wire={}B",
             common::fmt_int(mixed.messages),
+            if chunk_size == 0 {
+                "all".to_owned()
+            } else {
+                chunk_size.to_string()
+            },
             common::fmt_int(mixed.wire.len() as u64)
         );
         println!(
@@ -55,7 +61,7 @@ mod linux {
             "variant", "messages", "wall_ms", "user_ms", "msg/s", "MiB/s", "ns/msg"
         );
 
-        let counts = run_read(&mixed);
+        let counts = run_read(&mixed, chunk_size);
         assert_eq!(counts.sum, mixed.expected_sum);
         assert_eq!(counts.messages, mixed.messages);
         print_row("read 100k mixed messages", &counts, mixed.payload_bytes);
@@ -102,29 +108,28 @@ mod linux {
         }
     }
 
-    fn run_read(mixed: &MixedWire) -> Counts {
-        let mut ws = common::open_ws_client(mixed.wire.len(), mixed.max_payload_len);
+    fn run_read(mixed: &MixedWire, chunk_size: usize) -> Counts {
+        let recv_capacity = if chunk_size == 0 {
+            mixed.wire.len()
+        } else {
+            chunk_size.max(mixed.max_payload_len + MAX_HEADER_LEN)
+        };
+        let mut ws = common::open_ws_client(recv_capacity, mixed.max_payload_len);
         let mut messages = 0_u64;
         let mut sum = 0_u64;
 
         let cpu = common::ThreadCpuTimer::start();
         let wall = Instant::now();
-        ws.feed_recv(black_box(&mixed.wire));
-        ws.drain_data_events(|ev| {
-            messages += 1;
-            match ev {
-                DataEvent::Binary(payload) => {
-                    let bytes: [u8; 8] = payload.try_into().expect("binary id");
-                    let id = u64::from_le_bytes(bytes);
-                    sum = sum.wrapping_add(id);
-                }
-                DataEvent::Text(text) => {
-                    let id = parse_id(text);
-                    sum = sum.wrapping_add(id);
-                }
+        if chunk_size == 0 {
+            ws.feed_recv(black_box(&mixed.wire));
+            drain(&mut ws, &mut messages, &mut sum);
+        } else {
+            for chunk in black_box(&mixed.wire).chunks(chunk_size) {
+                ws.feed_recv(chunk);
+                drain(&mut ws, &mut messages, &mut sum);
             }
-        })
-        .expect("drain ws data");
+            drain(&mut ws, &mut messages, &mut sum);
+        }
 
         Counts {
             messages,
@@ -132,6 +137,24 @@ mod linux {
             elapsed: wall.elapsed(),
             cpu: cpu.elapsed(),
         }
+    }
+
+    fn drain(ws: &mut talaris::ws::WsClient, messages: &mut u64, sum: &mut u64) {
+        ws.drain_data_events(|ev| {
+            *messages += 1;
+            match ev {
+                DataEvent::Binary(payload) => {
+                    let bytes: [u8; 8] = payload.try_into().expect("binary id");
+                    let id = u64::from_le_bytes(bytes);
+                    *sum = (*sum).wrapping_add(id);
+                }
+                DataEvent::Text(text) => {
+                    let id = parse_id(text);
+                    *sum = (*sum).wrapping_add(id);
+                }
+            }
+        })
+        .expect("drain ws data");
     }
 
     fn parse_id(text: &str) -> u64 {

@@ -467,7 +467,7 @@ taskset -c 0-7 cargo bench --bench framing -- \
     --frames 1000000 --payloads 64,256,1024
 
 taskset -c 0-7 cargo bench --bench read -- \
-    --messages 100000
+    --messages 100000 --chunk-size 4096
 
 taskset -c 0-7 cargo bench --bench ws_chunking -- \
     --frames 1000000 --payload 256 --chunk-sizes 128,512,4096,65536

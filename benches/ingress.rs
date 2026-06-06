@@ -84,7 +84,10 @@ mod linux {
         while frames < target_frames {
             let result = if spin_iters == 0 {
                 pool.pump_data(|_, ev| {
-                    let payload = event_payload(ev);
+                    let payload = match ev {
+                        DataEvent::Binary(payload) => payload,
+                        DataEvent::Text(text) => text.as_bytes(),
+                    };
                     count_payload(
                         payload,
                         &mut frames,
@@ -98,7 +101,10 @@ mod linux {
                 .map(|()| true)
             } else {
                 pool.pump_data_spin(spin_iters, |_, ev| {
-                    let payload = event_payload(ev);
+                    let payload = match ev {
+                        DataEvent::Binary(payload) => payload,
+                        DataEvent::Text(text) => text.as_bytes(),
+                    };
                     count_payload(
                         payload,
                         &mut frames,
@@ -139,13 +145,6 @@ mod linux {
     fn frames_per_chunk(payload_len: usize) -> usize {
         let approximate_frame_len = payload_len.saturating_add(14).max(1);
         (64 * 1024 / approximate_frame_len).max(1)
-    }
-
-    fn event_payload(ev: DataEvent<'_>) -> &[u8] {
-        match ev {
-            DataEvent::Binary(payload) => payload,
-            DataEvent::Text(text) => text.as_bytes(),
-        }
     }
 
     fn count_payload(

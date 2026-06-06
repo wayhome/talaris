@@ -122,10 +122,10 @@ fn parse_cpu_args() -> usize {
     let mut user_cpu = 1_usize;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
-        if a.as_str() == "--user-cpu" {
-            if let Some(v) = args.next().and_then(|s| s.parse().ok()) {
-                user_cpu = v;
-            }
+        if a.as_str() == "--user-cpu"
+            && let Some(v) = args.next().and_then(|s| s.parse().ok())
+        {
+            user_cpu = v;
         }
     }
     user_cpu

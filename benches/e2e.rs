@@ -93,7 +93,7 @@ mod linux {
                 })
                 .expect("pump data");
             }
-            hist.record(sent_at.elapsed().as_nanos().max(1) as u64)
+            hist.record(common::duration_ns_u64(sent_at.elapsed()))
                 .expect("record rtt");
         }
         let elapsed = wall.elapsed();

@@ -27,10 +27,10 @@ where
 {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        if arg == flag {
-            if let Some(value) = args.next().and_then(|s| s.parse::<T>().ok()) {
-                return value;
-            }
+        if arg == flag
+            && let Some(value) = args.next().and_then(|s| s.parse::<T>().ok())
+        {
+            return value;
         }
     }
     default
@@ -103,11 +103,15 @@ impl ThreadCpuTimer {
         let end = thread_cpu_time();
         let sec = end.tv_sec - self.start.tv_sec;
         let nsec = end.tv_nsec - self.start.tv_nsec;
-        if nsec >= 0 {
-            Duration::new(sec as u64, nsec as u32)
+        let (sec, nsec) = if nsec >= 0 {
+            (sec, nsec)
         } else {
-            Duration::new((sec - 1) as u64, (nsec + 1_000_000_000) as u32)
-        }
+            (sec - 1, nsec + 1_000_000_000)
+        };
+        Duration::new(
+            u64::try_from(sec).expect("thread CPU clock is monotonic"),
+            u32::try_from(nsec).expect("normalized nsec fits u32"),
+        )
     }
 }
 
@@ -117,7 +121,7 @@ fn thread_cpu_time() -> libc::timespec {
         tv_nsec: 0,
     };
     // SAFETY: ts points to valid writable memory.
-    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &raw mut ts) };
     assert_eq!(rc, 0, "clock_gettime(CLOCK_THREAD_CPUTIME_ID) failed");
     ts
 }
@@ -126,7 +130,11 @@ pub fn ns_per_frame(cpu: Duration, frames: u64) -> u64 {
     if frames == 0 {
         return 0;
     }
-    (cpu.as_nanos() / u128::from(frames)) as u64
+    u64::try_from(cpu.as_nanos() / u128::from(frames)).unwrap_or(u64::MAX)
+}
+
+pub fn duration_ns_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos().max(1)).unwrap_or(u64::MAX)
 }
 
 pub fn cpu_pct(cpu: Duration, elapsed: Duration) -> f64 {
@@ -164,7 +172,12 @@ pub fn mib_per_sec(bytes: u64, elapsed: Duration) -> f64 {
 
 pub fn payload(payload_len: usize) -> Vec<u8> {
     (0..payload_len)
-        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
+        .map(|i| {
+            u8::try_from(i % 251)
+                .expect("modulo result fits u8")
+                .wrapping_mul(31)
+                .wrapping_add(7)
+        })
         .collect()
 }
 
@@ -198,7 +211,8 @@ pub fn parse_wire_frames(mut wire: &[u8]) -> (u64, u64) {
         let (header, header_len) = parse_header(wire)
             .expect("valid frame")
             .expect("full header");
-        let frame_len = header_len + header.payload_len as usize;
+        let payload_len = usize::try_from(header.payload_len).expect("payload fits usize");
+        let frame_len = header_len + payload_len;
         bytes += header.payload_len;
         frames += 1;
         wire = &wire[frame_len..];
@@ -322,7 +336,7 @@ fn read_client_frame(stream: &mut TcpStream) -> io::Result<Option<(OpCode, Vec<u
                 "websocket header too long",
             ));
         }
-        let n = stream.read(&mut header[filled..filled + 1])?;
+        let n = stream.read(&mut header[filled..=filled])?;
         if n == 0 {
             return Ok(None);
         }
@@ -333,7 +347,7 @@ fn read_client_frame(stream: &mut TcpStream) -> io::Result<Option<(OpCode, Vec<u
             break parsed;
         }
     };
-    let mut payload = vec![0_u8; frame.payload_len as usize];
+    let mut payload = vec![0_u8; usize::try_from(frame.payload_len).expect("payload fits usize")];
     stream.read_exact(&mut payload)?;
     if let Some(mask) = frame.mask {
         mask_inplace(&mut payload, mask);
@@ -355,18 +369,17 @@ pub fn maybe_record_arrival(
     sample_every: u64,
     frame: u64,
 ) {
-    if sample_every == 0 || frame % sample_every != 0 {
+    if sample_every == 0 || !frame.is_multiple_of(sample_every) {
         return;
     }
     let now = Instant::now();
     if let Some(prev) = last.replace(now) {
-        hist.record(now.duration_since(prev).as_nanos().max(1) as u64)
-            .ok();
+        hist.record(duration_ns_u64(now.duration_since(prev))).ok();
     }
 }
 
 pub fn print_hist(label: &str, hist: &hdrhistogram::Histogram<u64>) {
-    if hist.len() == 0 {
+    if hist.is_empty() {
         println!("{label}: no samples");
         return;
     }

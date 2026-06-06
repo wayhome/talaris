@@ -122,14 +122,13 @@ mod linux {
         let wall = Instant::now();
         if chunk_size == 0 {
             ws.feed_recv(black_box(&mixed.wire));
-            drain(&mut ws, &mut messages, &mut sum);
         } else {
             for chunk in black_box(&mixed.wire).chunks(chunk_size) {
                 ws.feed_recv(chunk);
                 drain(&mut ws, &mut messages, &mut sum);
             }
-            drain(&mut ws, &mut messages, &mut sum);
         }
+        drain(&mut ws, &mut messages, &mut sum);
 
         Counts {
             messages,

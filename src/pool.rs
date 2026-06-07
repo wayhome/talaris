@@ -364,7 +364,7 @@ impl Pool {
     /// 行情主循环：业务代码只关心 data payload，但连接层不能忽略 control frame。
     pub fn pump_data<F>(&mut self, sink: F) -> Result<(), ConnectionError>
     where
-        F: FnMut(ConnHandle, WsDataEvent<'_>),
+        F: for<'a> FnMut(ConnHandle, WsDataEvent<'a>),
     {
         self.pump_data_impl(1, sink)
     }
@@ -373,7 +373,7 @@ impl Pool {
     /// 没新 CQE 也不阻塞。配合 close handshake / 退出 cleanup 用。
     pub fn pump_data_nowait<F>(&mut self, sink: F) -> Result<(), ConnectionError>
     where
-        F: FnMut(ConnHandle, WsDataEvent<'_>),
+        F: for<'a> FnMut(ConnHandle, WsDataEvent<'a>),
     {
         self.pump_data_impl(0, sink)
     }
@@ -386,7 +386,7 @@ impl Pool {
     /// 返回值表示这一轮是否处理到了任何 CQE 或 WS event。
     pub fn pump_data_spin<F>(&mut self, spin_iters: usize, sink: F) -> Result<bool, ConnectionError>
     where
-        F: FnMut(ConnHandle, WsDataEvent<'_>),
+        F: for<'a> FnMut(ConnHandle, WsDataEvent<'a>),
     {
         self.pump_data_spin_impl(spin_iters, sink)
     }
@@ -396,7 +396,7 @@ impl Pool {
     /// TLS 解密后才进入 sink。
     fn pump_data_impl<F>(&mut self, wait_nr: usize, mut sink: F) -> Result<(), ConnectionError>
     where
-        F: FnMut(ConnHandle, WsDataEvent<'_>),
+        F: for<'a> FnMut(ConnHandle, WsDataEvent<'a>),
     {
         let Self {
             proactor,
@@ -428,11 +428,11 @@ impl Pool {
             let conn_id =
                 u32::try_from(c.user_data.token() & CONN_ID_MASK).expect("28-bit mask fits u32");
             if let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut) {
-                match conn.handle_completion(proactor, c) {
-                    Ok(()) => {
-                        if conn.take_ws_ingress_dirty_for_data_drain() {
-                            drain_conn_data_events(conn, &mut sink, &mut first_err);
-                        }
+                let handle = ConnHandle(conn.conn_id());
+                match conn.handle_completion_data(proactor, c, |ev| sink(handle, ev)) {
+                    Ok(_) => {
+                        conn.sync_ws_open_state();
+                        conn.sync_ws_close_state();
                     }
                     Err(e) => fail_conn(conn, e, &mut first_err),
                 }
@@ -449,7 +449,7 @@ impl Pool {
         mut sink: F,
     ) -> Result<bool, ConnectionError>
     where
-        F: FnMut(ConnHandle, WsDataEvent<'_>),
+        F: for<'a> FnMut(ConnHandle, WsDataEvent<'a>),
     {
         let Self {
             proactor,
@@ -709,7 +709,7 @@ fn drain_conn_completions_data<F>(
     first_err: &mut Option<ConnectionError>,
 ) -> usize
 where
-    F: FnMut(ConnHandle, WsDataEvent<'_>),
+    F: for<'a> FnMut(ConnHandle, WsDataEvent<'a>),
 {
     completions_buf.clear();
     let count = proactor.drain_completions(|c| completions_buf.push(c));
@@ -717,38 +717,17 @@ where
         let conn_id =
             u32::try_from(c.user_data.token() & CONN_ID_MASK).expect("28-bit mask fits u32");
         if let Some(conn) = conns.get_mut(conn_id as usize).and_then(Option::as_mut) {
-            match conn.handle_completion(proactor, c) {
-                Ok(()) => {
-                    if conn.take_ws_ingress_dirty_for_data_drain() {
-                        drain_conn_data_events(conn, sink, first_err);
-                    }
+            let handle = ConnHandle(conn.conn_id());
+            match conn.handle_completion_data(proactor, c, |ev| sink(handle, ev)) {
+                Ok(_) => {
+                    conn.sync_ws_open_state();
+                    conn.sync_ws_close_state();
                 }
                 Err(e) => fail_conn(conn, e, first_err),
             }
         }
     }
     count
-}
-
-fn drain_conn_data_events<F>(
-    conn: &mut ConnectionState,
-    sink: &mut F,
-    first_err: &mut Option<ConnectionError>,
-) -> usize
-where
-    F: FnMut(ConnHandle, WsDataEvent<'_>),
-{
-    let handle = ConnHandle(conn.conn_id());
-    let events = match conn.ws.drain_data_events(|ev| sink(handle, ev)) {
-        Ok(events) => events,
-        Err(e) => {
-            fail_conn(conn, ConnectionError::Ws(e), first_err);
-            0
-        }
-    };
-    conn.sync_ws_open_state();
-    conn.sync_ws_close_state();
-    events
 }
 
 /// pump 内 per-conn 错误处理：保留第一条错误，把对应 conn 推到 Closed 以便

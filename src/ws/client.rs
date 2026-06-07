@@ -69,6 +69,9 @@ pub struct WsConfig {
     pub initial_tx_buffer_capacity: Option<usize>,
     /// 收到 Ping 时自动回 Pong（默认 true）
     pub auto_pong: bool,
+    /// Hot-path opt-in: trust server text payloads are valid UTF-8 and skip
+    /// per-frame validation before constructing `&str`.
+    assume_text_utf8: bool,
 }
 
 impl WsConfig {
@@ -85,6 +88,7 @@ impl WsConfig {
             initial_message_buffer_capacity: None,
             initial_tx_buffer_capacity: None,
             auto_pong: true,
+            assume_text_utf8: false,
         }
     }
 
@@ -136,6 +140,20 @@ impl WsConfig {
         self.auto_pong = on;
         self
     }
+
+    /// Skip UTF-8 validation for incoming Text messages.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee every server Text payload is valid UTF-8 for
+    /// the whole connection lifetime. If the peer sends invalid UTF-8 while
+    /// this option is enabled, constructing `&str` with unchecked conversion is
+    /// undefined behavior.
+    #[must_use]
+    pub const unsafe fn with_assume_text_utf8_unchecked(mut self, on: bool) -> Self {
+        self.assume_text_utf8 = on;
+        self
+    }
 }
 
 /// 当前连接状态
@@ -156,7 +174,7 @@ pub enum ConnState {
 pub enum Event<'a> {
     /// handshake 完，可以发数据了
     HandshakeComplete,
-    /// 完整 text 消息（UTF-8 已校验）
+    /// 完整 text 消息（UTF-8 已校验，或由 unsafe config 显式承诺）
     Text(&'a str),
     /// 完整 binary 消息
     Binary(&'a [u8]),
@@ -171,7 +189,7 @@ pub enum Event<'a> {
 /// 只包含业务 data message 的轻量事件。
 #[derive(Debug)]
 pub enum DataEvent<'a> {
-    /// 完整 text 消息（UTF-8 已校验）
+    /// 完整 text 消息（UTF-8 已校验，或由 unsafe config 显式承诺）
     Text(&'a str),
     /// 完整 binary 消息
     Binary(&'a [u8]),
@@ -445,7 +463,7 @@ impl WsClient {
         let payload = &self.recv_buf.as_slice()[header_len..payload_end];
         let kind = match header.opcode {
             OpCode::Text => {
-                if std::str::from_utf8(payload).is_err() {
+                if !self.config.assume_text_utf8 && std::str::from_utf8(payload).is_err() {
                     self.queue_close(CloseCode::InvalidPayload.as_u16(), "invalid utf-8");
                     return Err(WsError::Utf8Invalid);
                 }
@@ -503,6 +521,51 @@ impl WsClient {
         }
     }
 
+    /// Feed a newly-arrived plaintext chunk and drain data events.
+    ///
+    /// Hot path: when `bytes` contains complete, unfragmented Text/Binary
+    /// frames and the internal parser is idle, payloads are borrowed directly
+    /// from `bytes` and dispatched to `sink` without copying the plaintext into
+    /// `recv_buf`.
+    ///
+    /// Fallback: partial frames, control frames, fragmented messages, handshakes
+    /// or any existing buffered state copy only the remaining bytes into
+    /// `recv_buf`, then continue through the full WebSocket state machine.
+    pub fn drain_data_events_from_ingress<F>(
+        &mut self,
+        bytes: &[u8],
+        mut sink: F,
+    ) -> Result<usize, WsError>
+    where
+        F: for<'a> FnMut(DataEvent<'a>),
+    {
+        self.clear_after_emit();
+        if bytes.is_empty() {
+            return self.drain_data_events(sink);
+        }
+
+        if self.can_drain_ingress_directly() {
+            let (events, consumed, result) =
+                self.try_drain_ingress_data_events(bytes, &mut sink)?;
+            match result {
+                DirectDataResult::Drained => return Ok(events),
+                DirectDataResult::WaitForMore => {
+                    self.recv_buf.extend_from_slice(&bytes[consumed..]);
+                    return Ok(events);
+                }
+                DirectDataResult::Fallback => {
+                    self.recv_buf.extend_from_slice(&bytes[consumed..]);
+                    return self
+                        .drain_data_events(&mut sink)
+                        .map(|fallback_events| events + fallback_events);
+                }
+            }
+        }
+
+        self.feed_recv(bytes);
+        self.drain_data_events(sink)
+    }
+
     /// data-only 常见路径：完整单帧直接借 recv_buf payload 给 sink，回调返回后
     /// 立即 consume。control / fragmented frame 返回 Fallback，由 poll_event
     /// 完整状态机接手。
@@ -530,11 +593,15 @@ impl WsClient {
                 return Ok((events, DirectDataResult::Drained));
             }
 
-            let (header, header_len) = match parse_header(bytes) {
-                Ok(Some(parsed)) => parsed,
-                Ok(None) => {
+            let header = match parse_server_data_header_fast(bytes) {
+                Ok(FastDataHeaderResult::Parsed(header)) => header,
+                Ok(FastDataHeaderResult::NeedMore) => {
                     self.recv_buf.consume(consumed);
                     return Ok((events, DirectDataResult::WaitForMore));
+                }
+                Ok(FastDataHeaderResult::Fallback) => {
+                    self.recv_buf.consume(consumed);
+                    return Ok((events, DirectDataResult::Fallback));
                 }
                 Err(e) => {
                     self.recv_buf.consume(consumed);
@@ -543,31 +610,13 @@ impl WsClient {
                 }
             };
 
-            if header.mask.is_some() {
-                self.recv_buf.consume(consumed);
-                self.queue_close(
-                    CloseCode::ProtocolError.as_u16(),
-                    "server sent masked frame",
-                );
-                return Err(WsError::Frame(FrameError::ServerSentMaskedFrame));
-            }
-            if !header.fin || !matches!(header.opcode, OpCode::Text | OpCode::Binary) {
-                self.recv_buf.consume(consumed);
-                return Ok((events, DirectDataResult::Fallback));
-            }
-            if header.payload_len > self.config.max_frame_payload {
+            if header.payload_len_u64 > self.config.max_frame_payload {
                 self.recv_buf.consume(consumed);
                 self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
                 return Err(WsError::MessageTooLarge);
             }
 
-            let payload_len = if let Ok(payload_len) = usize::try_from(header.payload_len) {
-                payload_len
-            } else {
-                self.recv_buf.consume(consumed);
-                self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
-                return Err(WsError::MessageTooLarge);
-            };
+            let payload_len = header.payload_len;
             if payload_len > self.config.max_message_size {
                 self.recv_buf.consume(consumed);
                 self.queue_close(
@@ -576,7 +625,7 @@ impl WsClient {
                 );
                 return Err(WsError::MessageTooLarge);
             }
-            let Some(frame_len) = header_len.checked_add(payload_len) else {
+            let Some(frame_len) = header.header_len.checked_add(payload_len) else {
                 self.recv_buf.consume(consumed);
                 self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
                 return Err(WsError::MessageTooLarge);
@@ -586,10 +635,15 @@ impl WsClient {
                 return Ok((events, DirectDataResult::WaitForMore));
             }
 
-            let payload = &bytes[header_len..frame_len];
+            let payload = &bytes[header.header_len..frame_len];
             match header.opcode {
                 OpCode::Text => {
-                    let text = if let Ok(text) = std::str::from_utf8(payload) {
+                    let text = if self.config.assume_text_utf8 {
+                        // SAFETY: Enabled only through `unsafe`
+                        // `WsConfig::with_assume_text_utf8_unchecked`, whose
+                        // caller promises all server text payloads are UTF-8.
+                        unsafe { std::str::from_utf8_unchecked(payload) }
+                    } else if let Ok(text) = std::str::from_utf8(payload) {
                         text
                     } else {
                         self.recv_buf.consume(consumed);
@@ -603,6 +657,103 @@ impl WsClient {
             }
             consumed += frame_len;
             events += 1;
+        }
+    }
+
+    #[inline]
+    fn can_drain_ingress_directly(&self) -> bool {
+        self.state == ConnState::Open
+            && self.parser.is_idle()
+            && self.msg_opcode.is_none()
+            && self.recv_buf.is_empty()
+            && self.borrowed_payload.is_none()
+    }
+
+    /// Direct data-only path over caller-owned ingress bytes. Returns
+    /// `(events, consumed, result)`.
+    fn try_drain_ingress_data_events<F>(
+        &mut self,
+        mut bytes: &[u8],
+        sink: &mut F,
+    ) -> Result<(usize, usize, DirectDataResult), WsError>
+    where
+        F: for<'a> FnMut(DataEvent<'a>),
+    {
+        let original_len = bytes.len();
+        let mut events = 0_usize;
+        loop {
+            if bytes.is_empty() {
+                return Ok((events, original_len, DirectDataResult::Drained));
+            }
+
+            let header = match parse_server_data_header_fast(bytes) {
+                Ok(FastDataHeaderResult::Parsed(header)) => header,
+                Ok(FastDataHeaderResult::NeedMore) => {
+                    return Ok((
+                        events,
+                        original_len - bytes.len(),
+                        DirectDataResult::WaitForMore,
+                    ));
+                }
+                Ok(FastDataHeaderResult::Fallback) => {
+                    return Ok((
+                        events,
+                        original_len - bytes.len(),
+                        DirectDataResult::Fallback,
+                    ));
+                }
+                Err(e) => {
+                    self.queue_close(CloseCode::ProtocolError.as_u16(), "frame parse error");
+                    return Err(WsError::Frame(e));
+                }
+            };
+
+            if header.payload_len_u64 > self.config.max_frame_payload {
+                self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
+                return Err(WsError::MessageTooLarge);
+            }
+
+            let payload_len = header.payload_len;
+            if payload_len > self.config.max_message_size {
+                self.queue_close(
+                    CloseCode::MessageTooBig.as_u16(),
+                    "message exceeds max_message_size",
+                );
+                return Err(WsError::MessageTooLarge);
+            }
+            let Some(frame_len) = header.header_len.checked_add(payload_len) else {
+                self.queue_close(CloseCode::MessageTooBig.as_u16(), "frame too large");
+                return Err(WsError::MessageTooLarge);
+            };
+            if bytes.len() < frame_len {
+                return Ok((
+                    events,
+                    original_len - bytes.len(),
+                    DirectDataResult::WaitForMore,
+                ));
+            }
+
+            let payload = &bytes[header.header_len..frame_len];
+            match header.opcode {
+                OpCode::Text => {
+                    let text = if self.config.assume_text_utf8 {
+                        // SAFETY: Enabled only through `unsafe`
+                        // `WsConfig::with_assume_text_utf8_unchecked`, whose
+                        // caller promises all server text payloads are UTF-8.
+                        unsafe { std::str::from_utf8_unchecked(payload) }
+                    } else {
+                        std::str::from_utf8(payload).map_err(|_| {
+                            self.queue_close(CloseCode::InvalidPayload.as_u16(), "invalid utf-8");
+                            WsError::Utf8Invalid
+                        })?
+                    };
+                    sink(DataEvent::Text(text));
+                }
+                OpCode::Binary => sink(DataEvent::Binary(payload)),
+                _ => unreachable!("guarded above"),
+            }
+            events += 1;
+            bytes = &bytes[frame_len..];
         }
     }
 
@@ -896,7 +1047,7 @@ impl WsClient {
 
         match msg_opcode {
             OpCode::Text => {
-                if std::str::from_utf8(&self.msg_buf).is_err() {
+                if !self.config.assume_text_utf8 && std::str::from_utf8(&self.msg_buf).is_err() {
                     self.queue_close(CloseCode::InvalidPayload.as_u16(), "invalid utf-8");
                     return Err(WsError::Utf8Invalid);
                 }
@@ -990,16 +1141,30 @@ impl WsClient {
         match kind {
             EmitKind::HandshakeComplete => Event::HandshakeComplete,
             EmitKind::Text => {
-                // utf-8 已在 on_frame_end 校验
-                let s = std::str::from_utf8(&self.msg_buf).unwrap_or("");
+                let s = if self.config.assume_text_utf8 {
+                    // SAFETY: Enabled only through `unsafe`
+                    // `WsConfig::with_assume_text_utf8_unchecked`, whose caller
+                    // promises all server text payloads are UTF-8.
+                    unsafe { std::str::from_utf8_unchecked(&self.msg_buf) }
+                } else {
+                    // utf-8 已在 on_frame_end 校验
+                    std::str::from_utf8(&self.msg_buf).unwrap_or("")
+                };
                 Event::Text(s)
             }
             EmitKind::Binary => Event::Binary(&self.msg_buf),
             EmitKind::BorrowedText => {
                 let payload = self.borrowed_payload();
-                // utf-8 已在 try_emit_borrowed_data 校验
-                let s = std::str::from_utf8(payload)
-                    .unwrap_or_else(|_| unreachable!("borrowed text must retain valid utf-8"));
+                let s = if self.config.assume_text_utf8 {
+                    // SAFETY: Enabled only through `unsafe`
+                    // `WsConfig::with_assume_text_utf8_unchecked`, whose caller
+                    // promises all server text payloads are UTF-8.
+                    unsafe { std::str::from_utf8_unchecked(payload) }
+                } else {
+                    // utf-8 已在 try_emit_borrowed_data 校验
+                    std::str::from_utf8(payload)
+                        .unwrap_or_else(|_| unreachable!("borrowed text must retain valid utf-8"))
+                };
                 Event::Text(s)
             }
             EmitKind::BorrowedBinary => Event::Binary(self.borrowed_payload()),
@@ -1078,6 +1243,71 @@ enum DirectDataResult {
     Fallback,
 }
 
+#[derive(Debug)]
+struct FastDataHeader {
+    opcode: OpCode,
+    header_len: usize,
+    payload_len: usize,
+    payload_len_u64: u64,
+}
+
+#[derive(Debug)]
+enum FastDataHeaderResult {
+    Parsed(FastDataHeader),
+    NeedMore,
+    Fallback,
+}
+
+#[inline]
+fn parse_server_data_header_fast(buf: &[u8]) -> Result<FastDataHeaderResult, FrameError> {
+    if buf.len() < 2 {
+        return Ok(FastDataHeaderResult::NeedMore);
+    }
+
+    let b0 = buf[0];
+    let b1 = buf[1];
+    if (b0 & 0x70) != 0 {
+        return Err(FrameError::RsvBitsSet);
+    }
+    if (b1 & 0x80) != 0 {
+        return Err(FrameError::ServerSentMaskedFrame);
+    }
+    if (b0 & 0x80) == 0 {
+        return Ok(FastDataHeaderResult::Fallback);
+    }
+
+    let opcode = match b0 & 0x0F {
+        0x1 => OpCode::Text,
+        0x2 => OpCode::Binary,
+        0x0 | 0x8 | 0x9 | 0xA => return Ok(FastDataHeaderResult::Fallback),
+        other => return Err(FrameError::InvalidOpCode(other)),
+    };
+
+    let len7 = b1 & 0x7F;
+    let (header_len, payload_len, payload_len_u64) = match len7 {
+        0..=125 => (2_usize, usize::from(len7), u64::from(len7)),
+        126 => {
+            if buf.len() < 4 {
+                return Ok(FastDataHeaderResult::NeedMore);
+            }
+            let val = u16::from_be_bytes([buf[2], buf[3]]);
+            if val < 126 {
+                return Err(FrameError::NonMinimalPayloadLength);
+            }
+            (4_usize, usize::from(val), u64::from(val))
+        }
+        127 => return Ok(FastDataHeaderResult::Fallback),
+        _ => unreachable!("len7 is masked to 7 bits"),
+    };
+
+    Ok(FastDataHeaderResult::Parsed(FastDataHeader {
+        opcode,
+        header_len,
+        payload_len,
+        payload_len_u64,
+    }))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {
@@ -1144,6 +1374,19 @@ mod tests {
         s.push_str(&format!("Sec-WebSocket-Accept: {accept}\r\n"));
         s.push_str("\r\n");
         s.into_bytes()
+    }
+
+    fn mk_open_client() -> WsClient {
+        let mut c = mk_client();
+        c.begin_handshake().unwrap();
+        c.ack_tx(c.pending_tx().len());
+        c.feed_recv(&fake_101_response(&c.client_key));
+        match c.poll_event() {
+            Some(Ok(Event::HandshakeComplete)) => {}
+            other => panic!("expected HandshakeComplete, got {other:?}"),
+        }
+        assert_eq!(c.state(), ConnState::Open);
+        c
     }
 
     #[test]
@@ -1301,6 +1544,106 @@ mod tests {
         assert!(
             !c.pending_tx().is_empty(),
             "Ping should have queued an auto-pong"
+        );
+    }
+
+    #[test]
+    fn drain_data_events_from_ingress_dispatches_direct_data_frames() {
+        let mut c = mk_open_client();
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&server_text(b"alpha"));
+        wire.extend_from_slice(&server_binary(b"bravo"));
+
+        let mut data = Vec::new();
+        let events = c
+            .drain_data_events_from_ingress(&wire, |ev| match ev {
+                DataEvent::Text(s) => data.push(format!("text:{s}")),
+                DataEvent::Binary(bytes) => {
+                    data.push(format!("binary:{}", std::str::from_utf8(bytes).unwrap()));
+                }
+            })
+            .unwrap();
+
+        assert_eq!(events, 2);
+        assert_eq!(
+            data,
+            vec!["text:alpha".to_owned(), "binary:bravo".to_owned()]
+        );
+        assert!(
+            c.recv_buf.is_empty(),
+            "complete direct frames should not copy"
+        );
+    }
+
+    #[test]
+    fn drain_data_events_from_ingress_dispatches_extended_16bit_text_frame() {
+        let mut c = mk_open_client();
+        let payload = vec![b'x'; 130];
+        let wire = server_text(&payload);
+
+        let mut text_len = 0_usize;
+        let events = c
+            .drain_data_events_from_ingress(&wire, |ev| match ev {
+                DataEvent::Text(s) => text_len = s.len(),
+                DataEvent::Binary(_) => panic!("unexpected binary"),
+            })
+            .unwrap();
+
+        assert_eq!(events, 1);
+        assert_eq!(text_len, payload.len());
+        assert!(
+            c.recv_buf.is_empty(),
+            "complete direct frames should not copy"
+        );
+    }
+
+    #[test]
+    fn drain_data_events_from_ingress_buffers_partial_frame() {
+        let mut c = mk_open_client();
+        let wire = server_text(b"partial");
+        let split_at = wire.len() - 2;
+
+        let mut data = Vec::new();
+        let events = c
+            .drain_data_events_from_ingress(&wire[..split_at], |ev| match ev {
+                DataEvent::Text(s) => data.push(s.to_owned()),
+                DataEvent::Binary(_) => panic!("unexpected binary"),
+            })
+            .unwrap();
+        assert_eq!(events, 0);
+        assert!(!c.recv_buf.is_empty(), "partial frame must be buffered");
+
+        let events = c
+            .drain_data_events_from_ingress(&wire[split_at..], |ev| match ev {
+                DataEvent::Text(s) => data.push(s.to_owned()),
+                DataEvent::Binary(_) => panic!("unexpected binary"),
+            })
+            .unwrap();
+        assert_eq!(events, 1);
+        assert_eq!(data, vec!["partial".to_owned()]);
+    }
+
+    #[test]
+    fn drain_data_events_from_ingress_falls_back_for_control_frames() {
+        let mut c = mk_open_client();
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&server_text(b"before"));
+        wire.extend_from_slice(&server_control(OpCode::Ping, b"hb"));
+        wire.extend_from_slice(&server_text(b"after"));
+
+        let mut data = Vec::new();
+        let events = c
+            .drain_data_events_from_ingress(&wire, |ev| match ev {
+                DataEvent::Text(s) => data.push(s.to_owned()),
+                DataEvent::Binary(_) => panic!("unexpected binary"),
+            })
+            .unwrap();
+
+        assert_eq!(events, 3);
+        assert_eq!(data, vec!["before".to_owned(), "after".to_owned()]);
+        assert!(
+            !c.pending_tx().is_empty(),
+            "Ping fallback should still queue auto-pong"
         );
     }
 

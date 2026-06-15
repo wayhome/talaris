@@ -13,6 +13,7 @@ use std::{io, sync::Arc};
 
 use thiserror::Error;
 
+use crate::observability::{ObservabilityError, ObservabilitySampleRate};
 use crate::proactor::{BufferRingError, ProactorConfig, ProactorError, ProactorSetupFlags};
 use crate::tls::TlsError;
 use crate::ws::{WsConfig, WsError};
@@ -66,6 +67,8 @@ pub enum ConnectionError {
     Tls(#[from] TlsError),
     #[error("ws: {0}")]
     Ws(#[from] WsError),
+    #[error("observability: {0}")]
+    Observability(#[from] ObservabilityError),
     #[error("operation not allowed in state {0:?}")]
     InvalidState(State),
     #[error("connect failed: {0}")]
@@ -93,12 +96,33 @@ pub struct IngressStats {
     pub recv_data_cqes: u64,
     /// Ciphertext bytes carried by those CQEs.
     pub recv_bytes: u64,
+    /// Times a recv multishot SQE was submitted or rearmed for this connection.
+    pub recv_multishot_rearms: u64,
     /// Multishot recv terminations caused by provided-buffer ring exhaustion.
     pub recv_ring_exhaustions: u64,
+    /// Consecutive plain TCP recv CQE runs handled by the data pump batch path.
+    pub plain_recv_batches: u64,
+    /// Total recv CQEs included in those plain TCP batch runs.
+    pub plain_recv_batch_cqes: u64,
+    /// Plain TCP batch runs parsed through the reusable copy scratch buffer.
+    pub plain_recv_copied_batches: u64,
+    /// Bytes copied into the reusable plain TCP batch scratch buffer.
+    pub plain_recv_copied_bytes: u64,
+    /// Plaintext chunks fed into the WebSocket parser. For TLS connections this
+    /// counts rustls plaintext chunks; for plain TCP this counts recv CQEs.
+    pub plaintext_chunks: u64,
+    /// Plaintext bytes fed into the WebSocket parser.
+    pub plaintext_bytes: u64,
     /// Data-pump CQEs that fed plaintext into the WebSocket receive buffer.
     pub ws_data_drains: u64,
     /// Data-pump CQEs that skipped WebSocket draining because no plaintext arrived.
     pub ws_data_drain_skips: u64,
+    /// Text/Binary data messages emitted to the user's data sink.
+    pub ws_data_events: u64,
+    /// Text messages emitted to the user's data sink.
+    pub ws_text_events: u64,
+    /// Binary messages emitted to the user's data sink.
+    pub ws_binary_events: u64,
 }
 
 /// 构造单条 conn 的参数。`proactor` 是创建 [`Pool`](crate::Pool) 时的便利默认值；
@@ -141,8 +165,19 @@ pub struct ConnectionConfig {
     /// TLS in-flight 期间延迟合入 `send_buf` 的密文 staging buffer 初始容量。
     /// `None` 表示沿用 `buf_ring_slot_size`。
     pub tls_pending_out_initial_capacity: Option<usize>,
+    /// Consecutive plain TCP recv CQEs in one data pump may be copied into a
+    /// reusable scratch buffer and parsed as one larger WebSocket input slice.
+    /// `0` disables copy aggregation. This only affects unmarked plain-WS data
+    /// pumps; TLS and marked observability paths preserve per-CQE staging.
+    pub plain_recv_batch_copy_max_bytes: usize,
     /// 收集 [`IngressStats`]。默认关闭，避免在生产 hot path 上无条件更新计数器。
     pub track_ingress_stats: bool,
+    /// Sampling rate for marked observability timestamps. Marked pumps default to
+    /// 100%; unmarked pumps never read these clocks.
+    pub observability_sample_rate: ObservabilitySampleRate,
+    /// Record sampled marked data-event stage latencies into per-connection
+    /// HdrHistograms for Prometheus export. Default off.
+    pub record_observability_histograms: bool,
 }
 
 impl ConnectionConfig {
@@ -162,7 +197,10 @@ impl ConnectionConfig {
             ws_config: None,
             send_buffer_initial_capacity: None,
             tls_pending_out_initial_capacity: None,
+            plain_recv_batch_copy_max_bytes: 0,
             track_ingress_stats: false,
+            observability_sample_rate: ObservabilitySampleRate::always(),
+            record_observability_histograms: false,
         }
     }
 
@@ -364,10 +402,41 @@ impl ConnectionConfig {
         self
     }
 
+    /// Enable copy aggregation for consecutive plain recv CQEs in one data pump.
+    ///
+    /// A value of `0` disables it. This is a throughput-oriented tuning knob:
+    /// it can give the WebSocket parser larger contiguous input, at the cost of
+    /// copying bytes and delaying the first message in the ready CQE run until
+    /// the run has been copied.
+    #[must_use]
+    pub const fn with_plain_recv_batch_copy_max_bytes(mut self, bytes: usize) -> Self {
+        self.plain_recv_batch_copy_max_bytes = bytes;
+        self
+    }
+
     /// 启用或关闭 ingress CQE 调优统计。生产连接默认关闭。
     #[must_use]
     pub const fn with_ingress_stats(mut self, on: bool) -> Self {
         self.track_ingress_stats = on;
+        self
+    }
+
+    /// Configure marked observability sampling in basis points.
+    ///
+    /// `10_000` means 100%, `1_000` means 10%, and values above `10_000`
+    /// saturate to 100%. This only affects marked data-pump APIs.
+    #[must_use]
+    pub const fn with_observability_sample_rate_bps(mut self, basis_points: u16) -> Self {
+        self.observability_sample_rate = ObservabilitySampleRate::from_basis_points(basis_points);
+        self
+    }
+
+    /// Enable per-connection HdrHistogram recording for marked observability
+    /// latency stages. Use [`crate::Pool::write_prometheus_metrics`] or
+    /// [`crate::Pool::prometheus_metrics`] to expose the current snapshot.
+    #[must_use]
+    pub const fn with_observability_histograms(mut self, on: bool) -> Self {
+        self.record_observability_histograms = on;
         self
     }
 }
